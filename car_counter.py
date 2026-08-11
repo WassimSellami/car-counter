@@ -3,91 +3,49 @@
 from collections import defaultdict
 import csv
 from datetime import datetime
-from enum import IntEnum
 import logging
 from pathlib import Path
 import time
+from typing import TextIO
 
 import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
 
-logging.getLogger("ultralytics").disabled = True
-
-CAMERA_INDEX = 0  # Set this to the DroidCam index printed by find_camera.py.
-# Requested DroidCam capture resolution. DroidCam must also be configured to
-# offer this resolution; otherwise its driver will use the nearest supported one.
-CAMERA_WIDTH = 1920
-CAMERA_HEIGHT = 1080
-# Use the fast model to preserve a responsive camera preview.
-MODEL_PATH = "yolo11s.pt"
-BICYCLE_CLASS_ID = 1  # COCO class ID for bicycles.
-CAR_CLASS_ID = 2  # COCO class ID for cars (including vans).
-BUS_CLASS_ID = 5  # COCO class ID for buses.
-TRUCK_CLASS_ID = 7  # COCO class ID for trucks.
-VEHICLE_CLASS_IDS = [
+from constants import (
     BICYCLE_CLASS_ID,
-    CAR_CLASS_ID,
+    BICYCLE_CONFIDENCE,
+    BICYCLE_DIRECTION_DISTANCE_RATIO,
     BUS_CLASS_ID,
+    CAMERA_HEIGHT,
+    CAMERA_INDEX,
+    CAMERA_WIDTH,
+    CAR_CLASS_ID,
+    CONFIDENCE,
+    IMAGE_SIZE,
+    LIGHT_BRIGHTNESS_THRESHOLD,
+    LIGHT_GROUP_X_DISTANCE,
+    LIGHT_GROUP_Y_DISTANCE,
+    LIGHT_MERGE_HEIGHT,
+    LIGHT_MERGE_WIDTH,
+    LIGHT_MIN_AREA,
+    LIGHT_TRACK_DISTANCE,
+    LIGHT_TRACK_MAX_MISSING,
+    MAX_DETECTIONS,
+    MIN_DIRECTION_DISTANCE_RATIO,
+    MODEL_CONFIDENCE,
+    MODEL_PATH,
+    NIGHT_MODE,
+    SELECT_CROP_ON_START,
+    TRACK_MEMORY_SECONDS,
     TRUCK_CLASS_ID,
-]
-# Boxes at or above this score are accepted for counting.
-CONFIDENCE = 0.40
-# Two-wheeled vehicles are smaller and often receive lower YOLO confidence scores.
-BICYCLE_CONFIDENCE = 0.10
-# Ask YOLO to return low-score car candidates too, so the display can show
-# whether each one was accepted or rejected by the threshold above.
-# Keep low-score candidates visible so the per-type thresholds can accept them.
-MODEL_CONFIDENCE = 0.05
-IMAGE_SIZE = 960
-# Maximum total detections retained per frame across every vehicle type.
-MAX_DETECTIONS = 15
-# Forget tracker IDs that have not appeared for this long. This prevents
-# tracker bookkeeping from growing indefinitely during multi-hour runs.
-TRACK_MEMORY_SECONDS = 120.0
-# Enable this at night to detect moving bright headlights rather than cars.
-NIGHT_MODE = False
-LIGHT_BRIGHTNESS_THRESHOLD = 180
-LIGHT_MIN_AREA = 8
-# Merge nearby headlights/reflections from a single vehicle into one box.
-LIGHT_MERGE_WIDTH = 55
-LIGHT_MERGE_HEIGHT = 11
-LIGHT_GROUP_X_DISTANCE = 60
-LIGHT_GROUP_Y_DISTANCE = 25
-LIGHT_TRACK_DISTANCE = 90
-LIGHT_TRACK_MAX_MISSING = 45
-# Draw the detection crop interactively at program startup. Select the road,
-# then press Enter or Space to confirm.
-SELECT_CROP_ON_START = True
-# A vehicle must move at least this fraction of the frame width before it is
-# counted. This prevents small tracker jitter from being counted as movement.
-MIN_DIRECTION_DISTANCE_RATIO = 0.08
-# Bicycles are smaller and usually remain visible for less of the road crop.
-BICYCLE_DIRECTION_DISTANCE_RATIO = 0.03
+    VEHICLE_CLASS_IDS,
+)
+from camera_utils import open_camera
+from enums import Direction, TimeOfDay, VehicleType
 
-
-class Direction(IntEnum):
-    """Numeric direction values written to the CSV."""
-
-    LEFT = 0
-    RIGHT = 1
-
-
-class VehicleType(IntEnum):
-    """Vehicle categories written to the CSV."""
-
-    CAR = 0
-    TRUCK = 1
-    BUS = 2
-    BICYCLE = 3
-
-
-class TimeOfDay(IntEnum):
-    """Lighting modes written to the CSV."""
-
-    DAY = 0
-    NIGHT = 1
+logging.getLogger("ultralytics").disabled = True
 
 
 def _confidence_threshold(vehicle_type: VehicleType) -> float:
@@ -102,6 +60,274 @@ def _direction_distance_ratio(vehicle_type: VehicleType) -> float:
     if vehicle_type is VehicleType.BICYCLE:
         return BICYCLE_DIRECTION_DISTANCE_RATIO
     return MIN_DIRECTION_DISTANCE_RATIO
+
+
+def _open_csv_writer(program_started_at: datetime) -> tuple[Path, TextIO, csv.DictWriter]:
+    output_directory = Path("outputs") / program_started_at.strftime("%Y-%m-%d")
+    output_directory.mkdir(parents=True, exist_ok=True)
+    csv_path = output_directory / f"car_counts_{program_started_at.strftime('%Y%m%d_%H%M%S')}.csv"
+    csv_file = csv_path.open("w", newline="", encoding="utf-8", buffering=1)
+    csv_writer = csv.DictWriter(
+        csv_file,
+        fieldnames=[
+            "id",
+            "timestamp",
+            "direction",
+            "vehicle_type",
+            "time_of_day",
+            "confidence",
+        ],
+    )
+    csv_writer.writeheader()
+    csv_file.flush()
+    return csv_path, csv_file, csv_writer
+
+
+class VehicleCounter:
+    def __init__(self) -> None:
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = None if NIGHT_MODE else YOLO(MODEL_PATH)
+        if self.model is not None:
+            self.model.to(self.device)
+        self.light_tracker = MovingLightTracker() if NIGHT_MODE else None
+        self.program_started_at = datetime.now()
+        self.csv_path, self.csv_file, self.csv_writer = _open_csv_writer(self.program_started_at)
+        self.next_record_id = 1
+        self.camera = open_camera(CAMERA_INDEX)
+        if not self.camera.isOpened():
+            self.csv_file.close()
+            raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
+
+        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        self.crop_x, self.crop_y, self.crop_width, self.crop_height = self._select_initial_crop()
+        self.track_history: dict[int, list[int]] = defaultdict(list)
+        self.counted_ids: set[int] = set()
+        self.vehicle_counts = {
+            (vehicle_type, direction): 0
+            for vehicle_type in VehicleType
+            for direction in Direction
+        }
+        self.minimum_distances = {
+            vehicle_type: max(25, int(self.crop_width * _direction_distance_ratio(vehicle_type)))
+            for vehicle_type in VehicleType
+        }
+        self.time_of_day_value = int(TimeOfDay.NIGHT if NIGHT_MODE else TimeOfDay.DAY)
+        self.base_row = {"time_of_day": self.time_of_day_value}
+        self.class_to_vehicle_type = {
+            BICYCLE_CLASS_ID: VehicleType.BICYCLE,
+            CAR_CLASS_ID: VehicleType.CAR,
+            BUS_CLASS_ID: VehicleType.BUS,
+            TRUCK_CLASS_ID: VehicleType.TRUCK,
+        }
+        self.track_last_seen: dict[int, float] = {}
+        self.fps = 0.0
+        self.previous_frame_time = time.perf_counter()
+        self.last_track_cleanup_time = self.previous_frame_time
+
+        if NIGHT_MODE:
+            assert self.light_tracker is not None
+        else:
+            assert self.model is not None
+
+    def _select_initial_crop(self) -> tuple[int, int, int, int]:
+        if SELECT_CROP_ON_START:
+            while True:
+                success, first_frame = self.camera.read()
+                if not success:
+                    self.camera.release()
+                    raise RuntimeError("Could not read a frame from the camera")
+
+                cv2.imshow("Camera Preview", first_frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("s"):
+                    break
+                if key == ord("q"):
+                    self.camera.release()
+                    cv2.destroyAllWindows()
+                    self.csv_file.close()
+                    raise SystemExit(0)
+
+            cv2.destroyWindow("Camera Preview")
+            return _select_crop(first_frame)
+
+        success, first_frame = self.camera.read()
+        if not success:
+            self.camera.release()
+            raise RuntimeError("Could not read a frame from the camera")
+        frame_height, frame_width = first_frame.shape[:2]
+        return 0, 0, frame_width, frame_height
+
+    def _read_detections(
+        self, frame: np.ndarray
+    ) -> list[tuple[tuple[float, float, float, float], int | None, float, VehicleType]]:
+        if NIGHT_MODE:
+            assert self.light_tracker is not None
+            return [
+                (
+                    (float(box[0]), float(box[1]), float(box[2]), float(box[3])),
+                    track_id,
+                    1.0,
+                    VehicleType.CAR,
+                )
+                for box, track_id in self.light_tracker.update(frame)
+            ]
+
+        assert self.model is not None
+        result = self.model.track(
+            frame,
+            persist=True,
+            tracker="vehicle_bytetrack.yaml",
+            classes=VEHICLE_CLASS_IDS,
+            conf=MODEL_CONFIDENCE,
+            imgsz=IMAGE_SIZE,
+            max_det=MAX_DETECTIONS,
+            device=self.device,
+            verbose=False,
+        )[0]
+        detections: list[tuple[tuple[float, float, float, float], int | None, float, VehicleType]] = []
+        if result.boxes is not None:
+            boxes: list[tuple[float, float, float, float]] = [
+                (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+                for box in result.boxes.xyxy.cpu().numpy()
+            ]
+            confidences = [float(value) for value in result.boxes.conf.cpu().numpy().tolist()]
+            class_ids = [int(value) for value in result.boxes.cls.cpu().numpy().tolist()]
+            track_ids = (
+                [int(value) for value in result.boxes.id.cpu().numpy().tolist()]
+                if result.boxes.id is not None
+                else [None] * len(boxes)
+            )
+            detections = [
+                (
+                    box,
+                    track_id,
+                    confidence,
+                    self.class_to_vehicle_type[class_id],
+                )
+                for box, track_id, confidence, class_id in zip(
+                    boxes, track_ids, confidences, class_ids
+                )
+            ]
+        return detections
+
+    def _record_count(
+        self,
+        track_id: int,
+        confidence: float,
+        vehicle_type: VehicleType,
+        count_direction: Direction,
+    ) -> None:
+        self.counted_ids.add(track_id)
+        self.vehicle_counts[(vehicle_type, count_direction)] += 1
+        self.csv_writer.writerow(
+            {
+                "id": self.next_record_id,
+                "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+                "direction": int(count_direction),
+                "vehicle_type": int(vehicle_type),
+                "confidence": f"{confidence:.4f}",
+                **self.base_row,
+            }
+        )
+        self.csv_file.flush()
+        self.next_record_id += 1
+
+    def _process_detections(
+        self,
+        frame: np.ndarray,
+        detections: list[tuple[tuple[float, float, float, float], int | None, float, VehicleType]],
+        current_time: float,
+    ) -> None:
+        if not detections:
+            return
+
+        for box, track_id, confidence, vehicle_type in detections:
+            x1, y1, x2, y2 = map(int, box)
+            center_x = (x1 + x2) // 2
+            accepted = confidence >= _confidence_threshold(vehicle_type)
+            if track_id is not None and accepted:
+                self.track_last_seen[track_id] = current_time
+                history = self.track_history[track_id]
+                history.append(center_x)
+                if len(history) > 30:
+                    history.pop(0)
+
+                initial_x = history[0]
+                horizontal_distance = center_x - initial_x
+                minimum_distance = self.minimum_distances[vehicle_type]
+                if horizontal_distance >= minimum_distance:
+                    count_direction = Direction.RIGHT
+                elif horizontal_distance <= -minimum_distance:
+                    count_direction = Direction.LEFT
+                else:
+                    count_direction = None
+                if count_direction is not None and track_id not in self.counted_ids:
+                    self._record_count(
+                        track_id, confidence, vehicle_type, count_direction
+                    )
+
+            color = (0, 255, 0) if accepted else (0, 165, 255)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+    def _cleanup_expired_tracks(self, current_time: float) -> None:
+        if current_time - self.last_track_cleanup_time < 10.0:
+            return
+
+        expired_track_ids = {
+            track_id
+            for track_id, last_seen in self.track_last_seen.items()
+            if current_time - last_seen >= TRACK_MEMORY_SECONDS
+        }
+        for track_id in expired_track_ids:
+            self.track_last_seen.pop(track_id, None)
+            self.track_history.pop(track_id, None)
+            self.counted_ids.discard(track_id)
+        self.last_track_cleanup_time = current_time
+
+    def _update_fps(self, current_time: float) -> None:
+        frame_duration = current_time - self.previous_frame_time
+        if frame_duration > 0:
+            instantaneous_fps = 1.0 / frame_duration
+            self.fps = instantaneous_fps if self.fps == 0 else 0.9 * self.fps + 0.1 * instantaneous_fps
+        self.previous_frame_time = current_time
+
+    def _show_frame(self, frame: np.ndarray) -> None:
+        display_height = max(frame.shape[0], 460)
+        video_area = np.zeros((display_height, frame.shape[1], 3), dtype=np.uint8)
+        video_area[: frame.shape[0], :] = frame
+        panel = _status_panel(display_height, self.vehicle_counts, self.fps)
+        cv2.imshow("Car Counter", np.hstack((video_area, panel)))
+
+    def run(self) -> None:
+        try:
+            while True:
+                success, frame = self.camera.read()
+                if not success:
+                    break
+
+                current_time = time.perf_counter()
+                frame = frame[
+                    self.crop_y : self.crop_y + self.crop_height,
+                    self.crop_x : self.crop_x + self.crop_width,
+                ]
+                if frame.size == 0:
+                    raise RuntimeError("Crop is empty; restart and select a valid crop")
+
+                detections = self._read_detections(frame)
+                self._process_detections(frame, detections, current_time)
+                self._cleanup_expired_tracks(current_time)
+                self._update_fps(current_time)
+                self._show_frame(frame)
+
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+        finally:
+            self.camera.release()
+            cv2.destroyAllWindows()
+            self.csv_file.close()
 
 
 def _status_panel(
@@ -217,7 +443,8 @@ class MovingLightTracker:
         candidates: list[tuple[int, int, int, int]] = []
         for contour in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
             if cv2.contourArea(contour) >= LIGHT_MIN_AREA:
-                candidates.append(cv2.boundingRect(contour))
+                x, y, width, height = cv2.boundingRect(contour)
+                candidates.append((x, y, width, height))
         candidates = self._merge_nearby_lights(candidates)
 
         matched_ids: set[int] = set()
@@ -275,224 +502,8 @@ class MovingLightTracker:
 
 
 def main() -> None:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = None if NIGHT_MODE else YOLO(MODEL_PATH)
-    if model is not None:
-        model.to(device)
-    light_tracker = MovingLightTracker() if NIGHT_MODE else None
-    program_started_at = datetime.now()
-    output_directory = Path("outputs") / program_started_at.strftime("%Y-%m-%d")
-    output_directory.mkdir(parents=True, exist_ok=True)
-    csv_path = output_directory / (
-        f"car_counts_{program_started_at.strftime('%Y%m%d_%H%M%S')}.csv"
-    )
-    # Line buffering ensures each count is visible in the file immediately.
-    csv_file = csv_path.open("w", newline="", encoding="utf-8", buffering=1)
-    csv_writer = csv.DictWriter(
-        csv_file,
-        fieldnames=[
-            "id",
-            "timestamp",
-            "direction",
-            "vehicle_type",
-            "time_of_day",
-            "confidence",
-        ],
-    )
-    csv_writer.writeheader()
-    csv_file.flush()
-    next_record_id = 1
-    camera = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-    if not camera.isOpened():
-        csv_file.close()
-        raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
-
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-    camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-    if SELECT_CROP_ON_START:
-        while True:
-            success, first_frame = camera.read()
-            if not success:
-                camera.release()
-                raise RuntimeError("Could not read a frame from the camera")
-
-            cv2.imshow("Camera Preview", first_frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("s"):
-                break
-            if key == ord("q"):
-                camera.release()
-                cv2.destroyAllWindows()
-                csv_file.close()
-                return
-
-        cv2.destroyWindow("Camera Preview")
-        crop_x, crop_y, crop_width, crop_height = _select_crop(first_frame)
-    else:
-        success, first_frame = camera.read()
-        if not success:
-            camera.release()
-            raise RuntimeError("Could not read a frame from the camera")
-        frame_height, frame_width = first_frame.shape[:2]
-        crop_x, crop_y, crop_width, crop_height = 0, 0, frame_width, frame_height
-
-    track_history: dict[int, list[int]] = defaultdict(list)
-    counted_ids: set[int] = set()
-    vehicle_counts = {
-        (vehicle_type, direction): 0
-        for vehicle_type in VehicleType
-        for direction in Direction
-    }
-    minimum_distances = {
-        vehicle_type: max(
-            25, int(crop_width * _direction_distance_ratio(vehicle_type))
-        )
-        for vehicle_type in VehicleType
-    }
-    time_of_day_value = int(TimeOfDay.NIGHT if NIGHT_MODE else TimeOfDay.DAY)
-    base_row = {
-        "time_of_day": time_of_day_value,
-    }
-    class_to_vehicle_type = {
-        BICYCLE_CLASS_ID: VehicleType.BICYCLE,
-        CAR_CLASS_ID: VehicleType.CAR,
-        BUS_CLASS_ID: VehicleType.BUS,
-        TRUCK_CLASS_ID: VehicleType.TRUCK,
-    }
-    track_last_seen: dict[int, float] = {}
-    fps = 0.0
-    previous_frame_time = time.perf_counter()
-    last_track_cleanup_time = previous_frame_time
-
-    if NIGHT_MODE:
-        assert light_tracker is not None
-    else:
-        assert model is not None
-
-    try:
-        while True:
-            success, frame = camera.read()
-            if not success:
-                break
-            current_time = time.perf_counter()
-
-            frame = frame[
-                crop_y : crop_y + crop_height,
-                crop_x : crop_x + crop_width,
-            ]
-            if frame.size == 0:
-                raise RuntimeError("Crop is empty; restart and select a valid crop")
-
-            if NIGHT_MODE:
-                detections = [
-                    (box, track_id, 1.0, VehicleType.CAR)
-                    for box, track_id in light_tracker.update(frame)
-                ]
-            else:
-                result = model.track(
-                    frame,
-                    persist=True,
-                    tracker="vehicle_bytetrack.yaml",
-                    classes=VEHICLE_CLASS_IDS,
-                    conf=MODEL_CONFIDENCE,
-                    imgsz=IMAGE_SIZE,
-                    max_det=MAX_DETECTIONS,
-                    device=device,
-                    verbose=False,
-                )[0]
-                detections = []
-                if result.boxes is not None:
-                    boxes = result.boxes.xyxy.cpu().numpy()
-                    confidences = result.boxes.conf.cpu().tolist()
-                    class_ids = result.boxes.cls.int().cpu().tolist()
-                    track_ids = (
-                        result.boxes.id.int().cpu().tolist()
-                        if result.boxes.id is not None
-                        else [None] * len(boxes)
-                    )
-                    detections = [
-                        (
-                            box,
-                            track_id,
-                            confidence,
-                            class_to_vehicle_type[class_id],
-                        )
-                        for box, track_id, confidence, class_id in zip(
-                            boxes, track_ids, confidences, class_ids
-                        )
-                    ]
-
-            if detections:
-                for box, track_id, confidence, vehicle_type in detections:
-                    x1, y1, x2, y2 = map(int, box)
-                    center_x = (x1 + x2) // 2
-                    accepted = confidence >= _confidence_threshold(vehicle_type)
-                    if track_id is not None and accepted:
-                        track_last_seen[track_id] = current_time
-                        history = track_history[track_id]
-                        history.append(center_x)
-                        if len(history) > 30:
-                            history.pop(0)
-
-                        initial_x = history[0]
-                        horizontal_distance = center_x - initial_x
-                        minimum_distance = minimum_distances[vehicle_type]
-                        if horizontal_distance >= minimum_distance:
-                            count_direction = Direction.RIGHT
-                        elif horizontal_distance <= -minimum_distance:
-                            count_direction = Direction.LEFT
-                        else:
-                            count_direction = None
-                        if count_direction is not None and track_id not in counted_ids:
-                            counted_ids.add(track_id)
-                            vehicle_counts[(vehicle_type, count_direction)] += 1
-                            csv_writer.writerow(
-                                {
-                                    "id": next_record_id,
-                                    "timestamp": datetime.now().isoformat(timespec="milliseconds"),
-                                    "direction": int(count_direction),
-                                    "vehicle_type": int(vehicle_type),
-                                    "confidence": f"{confidence:.4f}",
-                                    **base_row,
-                                }
-                            )
-                            csv_file.flush()
-                            next_record_id += 1
-
-                    color = (0, 255, 0) if accepted else (0, 165, 255)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            if current_time - last_track_cleanup_time >= 10.0:
-                expired_track_ids = {
-                    track_id
-                    for track_id, last_seen in track_last_seen.items()
-                    if current_time - last_seen >= TRACK_MEMORY_SECONDS
-                }
-                for track_id in expired_track_ids:
-                    track_last_seen.pop(track_id, None)
-                    track_history.pop(track_id, None)
-                    counted_ids.discard(track_id)
-                last_track_cleanup_time = current_time
-
-            frame_duration = current_time - previous_frame_time
-            if frame_duration > 0:
-                instantaneous_fps = 1.0 / frame_duration
-                fps = instantaneous_fps if fps == 0 else 0.9 * fps + 0.1 * instantaneous_fps
-            previous_frame_time = current_time
-            display_height = max(frame.shape[0], 460)
-            video_area = np.zeros((display_height, frame.shape[1], 3), dtype=np.uint8)
-            video_area[: frame.shape[0], :] = frame
-            panel = _status_panel(display_height, vehicle_counts, fps)
-            cv2.imshow("Car Counter", np.hstack((video_area, panel)))
-
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-    finally:
-        camera.release()
-        cv2.destroyAllWindows()
-        csv_file.close()
+    counter = VehicleCounter()
+    counter.run()
 
 if __name__ == "__main__":
     main()

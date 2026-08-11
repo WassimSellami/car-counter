@@ -29,6 +29,31 @@ There is no counting line. A tracked car is counted once after it moves horizont
 
 Each run creates a CSV file at `outputs/YYYY-MM-DD/car_counts_YYYYMMDD_HHMMSS.csv`, grouping results by the day the program started. A row is written and flushed immediately for every counted vehicle: `0.40` confidence for cars/vans, trucks, and buses; `0.10` for bicycles. Its columns are `id`, `timestamp`, `direction` (`0` = left, `1` = right), `vehicle_type` (`0` = car or van, `1` = truck, `2` = bus, `3` = bicycle), `time_of_day` (`0` = day, `1` = night), and `confidence`. The COCO model does not provide a separate van class, so vans are detected and recorded as cars.
 
+## Traffic analysis
+
+Generate direction and vehicle-type charts from every recorded CSV with:
+
+```powershell
+pip install -r requirements.txt
+python vehicle_counter_analysis.py
+```
+
+The script deliberately ignores `confidence` and `time_of_day`. It writes these charts plus a `summary.csv` to `outputs/analysis/`:
+
+- hourly stacked direction flow;
+- hourly stacked vehicle types;
+- continuous 30-minute flow with smoothed lines: category colour, solid right-bound line, and dashed left-bound line;
+- direction × vehicle-type heatmap;
+- vehicle-mix pie charts for left- and right-bound traffic.
+
+To analyse only selected runs, pass their file paths, for example:
+
+```powershell
+python vehicle_counter_analysis.py outputs/2026-08-11/car_counts_20260811_195938.csv
+```
+
+Use a different bucket width when needed, for example `--interval-minutes 10`.
+
 `vehicle_bytetrack.yaml` lowers ByteTrack's ID-creation threshold to match the bicycle threshold. A green box is accepted, but it is written to the CSV only after it receives a stable tracker ID and travels at least `MIN_DIRECTION_DISTANCE_RATIO` across the selected crop.
 
 For long-running sessions, tracker histories and counted IDs that have been absent for two minutes are removed automatically to keep memory use bounded.

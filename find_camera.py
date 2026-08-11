@@ -2,10 +2,12 @@
 
 import cv2
 
+from camera_utils import open_camera
+
 
 def main() -> None:
     for index in range(10):
-        camera = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        camera = open_camera(index)
         try:
             if not camera.isOpened():
                 continue

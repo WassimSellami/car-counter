@@ -3,6 +3,8 @@
 import cv2
 import time
 
+from camera_utils import open_camera
+
 CAMERA_INDEX = 0  # Set this to the DroidCam index printed by find_camera.py.
 CAMERA_WIDTH = 1920
 CAMERA_HEIGHT = 1080
@@ -10,7 +12,7 @@ MEASUREMENT_SECONDS = 5
 
 
 def main() -> None:
-    camera = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+    camera = open_camera(CAMERA_INDEX)
     if not camera.isOpened():
         raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
 
