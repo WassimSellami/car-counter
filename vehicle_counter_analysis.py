@@ -22,9 +22,9 @@ import pandas as pd
 import seaborn as sns
 
 
-DIRECTION_LABELS = {0: "Left", 1: "Right"}
+DIRECTION_LABELS = {0: "Out of Passau", 1: "Into Passau"}
 VEHICLE_TYPE_LABELS = {0: "Car / van", 1: "Truck", 2: "Bus", 3: "Bicycle"}
-DIRECTION_COLORS = {"Left": "#4C78A8", "Right": "#F58518"}
+DIRECTION_COLORS = {"Into Passau": "#4C78A8", "Out of Passau": "#F58518"}
 VEHICLE_COLORS = {"Car / van": "#4C78A8", "Truck": "#F58518", "Bus": "#54A24B", "Bicycle": "#E45756"}
 
 
@@ -82,9 +82,9 @@ def save_hourly_direction_chart(data: pd.DataFrame, output_dir: Path) -> None:
         figsize=(12, 6),
         width=0.85,
     )
-    axis.set(title="Hourly traffic flow by direction", xlabel="Hour of day", ylabel="Vehicles")
+    axis.set(title="Hourly traffic flow by travel direction", xlabel="Hour of day", ylabel="Vehicles")
     axis.set_xticklabels(range(24), rotation=0)
-    axis.legend(title="Direction")
+    axis.legend(title="Travel direction")
     axis.figure.tight_layout()
     axis.figure.savefig(output_dir / "hourly_direction_flow.png", dpi=180)
     plt.close(axis.figure)
@@ -104,8 +104,12 @@ def save_continuous_flow_chart(data: pd.DataFrame, output_dir: Path, interval_mi
     grouped = data.groupby([pd.Grouper(key="timestamp", freq=frequency), "vehicle_type", "direction"]).size()
 
     figure, axis = plt.subplots(figsize=(15, 6))
+    date_label = data["timestamp"].dt.strftime("%d %b %Y").iloc[0]
+    axis.set_title(f"Traffic flow every {interval_minutes} minutes\n{date_label}", pad=8)
+    direction_handles: dict[str, list] = {"Into Passau": [], "Out of Passau": []}
+
     for vehicle_type in VEHICLE_TYPE_LABELS.values():
-        for direction, line_style in (("Right", "-"), ("Left", "--")):
+        for direction, line_style in (("Into Passau", "-"), ("Out of Passau", "--")):
             series = grouped.reindex(
                 pd.MultiIndex.from_product(
                     [buckets, [vehicle_type], [direction]],
@@ -124,23 +128,37 @@ def save_continuous_flow_chart(data: pd.DataFrame, output_dir: Path, interval_mi
             else:
                 smoothed = values
 
-            axis.plot(
+            line, = axis.plot(
                 buckets,
                 smoothed,
                 color=VEHICLE_COLORS[vehicle_type],
                 linestyle=line_style,
                 linewidth=2.0,
                 alpha=0.95,
-                label=f"{vehicle_type} — {direction}",
+                label=vehicle_type,
             )
+            direction_handles[direction].append(line)
 
     axis.set(
-        title=f"Traffic flow every {interval_minutes} minutes",
         xlabel="Time",
         ylabel="Counted vehicles per interval",
     )
-    axis.xaxis.set_major_formatter(mdates.DateFormatter("%d %b\n%H:%M"))
-    axis.legend(title="Category — direction", ncols=2, loc="upper left")
+    axis.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    into_legend = axis.legend(
+        direction_handles["Into Passau"],
+        VEHICLE_TYPE_LABELS.values(),
+        title="Into Passau",
+        loc="upper left",
+        bbox_to_anchor=(0, 1),
+    )
+    axis.add_artist(into_legend)
+    axis.legend(
+        direction_handles["Out of Passau"],
+        VEHICLE_TYPE_LABELS.values(),
+        title="Out of Passau",
+        loc="upper left",
+        bbox_to_anchor=(0.095, 1),
+    )
     figure.autofmt_xdate()
     figure.tight_layout()
     figure.savefig(output_dir / f"continuous_flow_{interval_minutes}_minutes.png", dpi=180)
@@ -173,7 +191,7 @@ def save_direction_vehicle_heatmap(data: pd.DataFrame, output_dir: Path) -> None
     )
     figure, axis = plt.subplots(figsize=(9, 4.5))
     sns.heatmap(matrix, annot=True, fmt="d", cmap="Blues", linewidths=0.5, ax=axis)
-    axis.set(title="Vehicle type by travel direction", xlabel="Vehicle type", ylabel="Direction")
+    axis.set(title="Vehicle type by travel direction", xlabel="Vehicle type", ylabel="Travel direction")
     figure.tight_layout()
     figure.savefig(output_dir / "direction_vehicle_matrix.png", dpi=180)
     plt.close(figure)
@@ -195,8 +213,8 @@ def save_direction_pies(data: pd.DataFrame, output_dir: Path) -> None:
                 startangle=90,
                 colors=[VEHICLE_COLORS[vehicle] for vehicle in nonzero.index],
             )
-        axis.set_title(f"{direction}-bound vehicles")
-    figure.suptitle("Vehicle mix by direction")
+        axis.set_title(f"{direction} traffic")
+    figure.suptitle("Vehicle mix by travel direction")
     figure.tight_layout()
     figure.savefig(output_dir / "vehicle_mix_by_direction.png", dpi=180)
     plt.close(figure)
