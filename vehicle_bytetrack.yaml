@@ -1,0 +1,10 @@
+# ByteTrack settings for vehicle counting.
+# Match the lower bicycle/motorcycle acceptance thresholds so accepted
+# two-wheeled detections can receive persistent IDs and be counted.
+tracker_type: bytetrack
+track_high_thresh: 0.15
+track_low_thresh: 0.05
+new_track_thresh: 0.15
+track_buffer: 30
+match_thresh: 0.8
+fuse_score: True

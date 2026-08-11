@@ -1,0 +1,16 @@
+# Python virtual environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Generated application data
+outputs/
+
+# Downloaded model weights
+*.pt
+
+# Local environment and editor settings
+.env
+.vscode/
+.idea/
