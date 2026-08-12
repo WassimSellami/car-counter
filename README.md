@@ -27,7 +27,7 @@ Press `q` to close either video window. The first run downloads `yolo11n.pt`.
 
 There is no counting line. A tracked car is counted once after it moves horizontally by at least `MIN_DIRECTION_DISTANCE_RATIO` of the frame width. Movement right increments `Going right`; movement left increments `Going left`.
 
-Each run creates a CSV file at `outputs/YYYY-MM-DD/car_counts_YYYYMMDD_HHMMSS.csv`, grouping results by the day the program started. A row is written and flushed immediately for every counted vehicle: `0.40` confidence for cars/vans, trucks, and buses; `0.10` for bicycles. Its columns are `id`, `timestamp`, `direction` (`0` = left, `1` = right), `vehicle_type` (`0` = car or van, `1` = truck, `2` = bus, `3` = bicycle), `time_of_day` (`0` = day, `1` = night), and `confidence`. The COCO model does not provide a separate van class, so vans are detected and recorded as cars.
+Each calendar day has one CSV at `outputs/YYYY-MM-DD/count_YYYYMMDD.csv`. On startup, the counter reads that day's existing rows and restores the displayed totals before appending new rows to the same file. It automatically switches to a new daily file at midnight. A row is written and flushed immediately for every counted vehicle: `0.40` confidence for cars/vans, trucks, and buses; `0.10` for bicycles. Its columns are `id`, `timestamp`, `direction` (`0` = left, `1` = right), `vehicle_type` (`0` = car or van, `1` = truck, `2` = bus, `3` = bicycle), `time_of_day` (`0` = day, `1` = night), and `confidence`. The COCO model does not provide a separate van class, so vans are detected and recorded as cars.
 
 ## Traffic analysis
 
@@ -64,10 +64,47 @@ Streamlit opens the dashboard in your browser (normally at
 `Shown lines` selector to show or hide individual lines. These choices remain
 applied while the graph refreshes every five seconds.
 
+### Supabase cloud sync
+
+The cloud dashboard needs a shared data source because it cannot access this
+computer's camera or `outputs` folder. After the initial backfill, new count
+rows are uploaded directly by `car_counter.py` in a background worker.
+
+1. Create a Supabase project and run [supabase_setup.sql](supabase_setup.sql)
+   in its SQL Editor.
+2. Add the project URL and **service_role** key to the ignored `.env` file (do
+   not commit this key):
+
+   ```dotenv
+   SUPABASE_URL=https://YOUR-PROJECT.supabase.co
+   SUPABASE_SERVICE_ROLE_KEY=YOUR-SERVICE-ROLE-KEY
+   ```
+
+   Backfill existing history once by running:
+
+   ```powershell
+   python sync_counts_to_supabase.py
+   ```
+
+   The sync program uploads the existing CSV history. Once it completes, stop
+   it with `Ctrl+C`; future rows are uploaded directly by `car_counter.py`.
+
+3. In Streamlit Community Cloud, add these same two values in **App settings →
+   Secrets**:
+
+   ```toml
+   SUPABASE_URL = "https://YOUR-PROJECT.supabase.co"
+   SUPABASE_SERVICE_ROLE_KEY = "YOUR-SERVICE-ROLE-KEY"
+   ```
+
+   Redeploy the app. When these secrets are present, the live dashboard reads
+   the selected day's rows from Supabase; without them, it continues using local
+   CSV files.
+
 To analyse only selected runs, pass their file paths, for example:
 
 ```powershell
-python vehicle_counter_analysis.py outputs/2026-08-11/car_counts_20260811_195938.csv
+python vehicle_counter_analysis.py outputs/2026-08-11/count_20260811.csv
 ```
 
 Use a different bucket width when needed, for example `--interval-minutes 10`.

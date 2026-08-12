@@ -2,14 +2,18 @@
 
 from collections import defaultdict
 import csv
-from datetime import datetime, timedelta
+from datetime import date, datetime
 import logging
+import os
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 import time
 from typing import TextIO
 
 import cv2
 import numpy as np
+import requests
 import torch
 from ultralytics import YOLO
 
@@ -23,8 +27,6 @@ from constants import (
     CAMERA_WIDTH,
     CAR_CLASS_ID,
     CONFIDENCE,
-    DETECTION_START_HOUR,
-    DETECTION_START_MINUTE,
     IMAGE_SIZE,
     LIGHT_BRIGHTNESS_THRESHOLD,
     LIGHT_GROUP_X_DISTANCE,
@@ -64,47 +66,131 @@ def _direction_distance_ratio(vehicle_type: VehicleType) -> float:
     return MIN_DIRECTION_DISTANCE_RATIO
 
 
-def _open_csv_writer(program_started_at: datetime) -> tuple[Path, TextIO, csv.DictWriter]:
-    output_directory = Path("outputs") / program_started_at.strftime("%Y-%m-%d")
-    output_directory.mkdir(parents=True, exist_ok=True)
-    csv_path = output_directory / f"car_counts_{program_started_at.strftime('%Y%m%d_%H%M%S')}.csv"
-    csv_file = csv_path.open("w", newline="", encoding="utf-8", buffering=1)
-    csv_writer = csv.DictWriter(
-        csv_file,
-        fieldnames=[
-            "id",
-            "timestamp",
-            "direction",
-            "vehicle_type",
-            "time_of_day",
-            "confidence",
-        ],
-    )
-    csv_writer.writeheader()
-    csv_file.flush()
-    return csv_path, csv_file, csv_writer
+CSV_FIELDNAMES = ["id", "timestamp", "direction", "vehicle_type", "time_of_day", "confidence"]
 
 
-def _wait_for_scheduled_start() -> None:
-    """Wait until the next configured local start time without using the GPU."""
-    now = datetime.now()
-    start_at = now.replace(
-        hour=DETECTION_START_HOUR,
-        minute=DETECTION_START_MINUTE,
-        second=0,
-        microsecond=0,
-    )
-    if now > start_at:
-        start_at += timedelta(days=1)
+def _empty_vehicle_counts() -> dict[tuple[VehicleType, Direction], int]:
+    return {
+        (vehicle_type, direction): 0
+        for vehicle_type in VehicleType
+        for direction in Direction
+    }
 
-    remaining_seconds = (start_at - now).total_seconds()
-    if remaining_seconds <= 0:
+
+def _load_dotenv() -> None:
+    """Load local Supabase credentials without committing them to the project."""
+    env_file = Path(".env")
+    if not env_file.is_file():
         return
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        if not line or line.lstrip().startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", maxsplit=1)
+        os.environ.setdefault(name.strip(), value.strip().strip('"').strip("'"))
 
-    print(f"Waiting until {start_at:%Y-%m-%d %H:%M} local time to start detection.")
-    while remaining_seconds > 0:
-        time.sleep(min(remaining_seconds, 60.0))
-        remaining_seconds = (start_at - datetime.now()).total_seconds()
+
+class SupabaseCountUploader:
+    """Upload new count rows in the background without delaying detection."""
+
+    def __init__(self) -> None:
+        _load_dotenv()
+        self.url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+        self.service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+        self.queue: Queue[dict | None] = Queue()
+        self.worker: Thread | None = None
+        if self.url and self.service_key:
+            self.worker = Thread(target=self._upload_loop, daemon=True)
+            self.worker.start()
+
+    def submit(self, row: dict) -> None:
+        if self.worker is not None:
+            self.queue.put(row)
+
+    def close(self) -> None:
+        if self.worker is not None:
+            self.queue.put(None)
+            self.worker.join(timeout=2)
+
+    def _upload_loop(self) -> None:
+        while True:
+            row = self.queue.get()
+            if row is None:
+                return
+            while True:
+                try:
+                    response = requests.post(
+                        f"{self.url}/rest/v1/traffic_counts",
+                        params={"on_conflict": "record_id"},
+                        headers={
+                            "apikey": self.service_key,
+                            "Authorization": f"Bearer {self.service_key}",
+                            "Content-Type": "application/json",
+                            "Prefer": "resolution=merge-duplicates,return=minimal",
+                        },
+                        json=[row],
+                        timeout=10,
+                    )
+                    response.raise_for_status()
+                    break
+                except requests.RequestException:
+                    # The CSV remains the durable local record; retry without
+                    # blocking the camera/detection loop.
+                    time.sleep(5)
+
+
+def _load_daily_counts(output_directory: Path) -> dict[tuple[VehicleType, Direction], int]:
+    """Restore totals from the daily CSV, falling back to legacy files if needed."""
+    counts = _empty_vehicle_counts()
+    daily_files = list(output_directory.glob("count_*.csv"))
+    # A count file may have been created by copying a legacy run file. Do
+    # not add both, because they represent the same earlier detections.
+    patterns = ("count_*.csv",) if daily_files else ("car_counts_*.csv",)
+    for pattern in patterns:
+        for csv_path in output_directory.glob(pattern):
+            try:
+                with csv_path.open("r", newline="", encoding="utf-8") as csv_file:
+                    for row in csv.DictReader(csv_file):
+                        try:
+                            vehicle_type = VehicleType(int(row["vehicle_type"]))
+                            direction = Direction(int(row["direction"]))
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        counts[(vehicle_type, direction)] += 1
+            except OSError:
+                continue
+    return counts
+
+
+def _next_record_id() -> int:
+    """Return the next globally unique ID across all counter CSV files."""
+    highest_id = 0
+    for csv_path in Path("outputs").glob("**/count_*.csv"):
+        try:
+            with csv_path.open("r", newline="", encoding="utf-8") as csv_file:
+                for row in csv.DictReader(csv_file):
+                    try:
+                        highest_id = max(highest_id, int(row["id"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+        except OSError:
+            continue
+    return highest_id + 1
+
+
+def _open_csv_writer(day: date) -> tuple[Path, TextIO, csv.DictWriter, dict[tuple[VehicleType, Direction], int], int]:
+    """Append to the day's CSV and restore its accumulated totals."""
+    output_directory = Path("outputs") / day.isoformat()
+    output_directory.mkdir(parents=True, exist_ok=True)
+    csv_path = output_directory / f"count_{day.strftime('%Y%m%d')}.csv"
+    has_rows = csv_path.is_file() and csv_path.stat().st_size > 0
+    counts = _load_daily_counts(output_directory)
+    next_record_id = _next_record_id()
+    csv_file = csv_path.open("a", newline="", encoding="utf-8", buffering=1)
+    csv_writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDNAMES)
+    if not has_rows:
+        csv_writer.writeheader()
+        csv_file.flush()
+    return csv_path, csv_file, csv_writer, counts, next_record_id
 
 
 def _select_startup_crop() -> tuple[int, int, int, int]:
@@ -143,21 +229,24 @@ class VehicleCounter:
             self.model.to(self.device)
         self.light_tracker = MovingLightTracker() if NIGHT_MODE else None
         self.program_started_at = datetime.now()
-        self.csv_path, self.csv_file, self.csv_writer = _open_csv_writer(self.program_started_at)
-        self.next_record_id = 1
+        self.csv_day = self.program_started_at.date()
+        (
+            self.csv_path,
+            self.csv_file,
+            self.csv_writer,
+            self.vehicle_counts,
+            self.next_record_id,
+        ) = _open_csv_writer(self.csv_day)
+        self.supabase_uploader = SupabaseCountUploader()
         self.camera = open_camera(CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT)
         if not self.camera.isOpened():
             self.csv_file.close()
+            self.supabase_uploader.close()
             raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
 
         self.crop_x, self.crop_y, self.crop_width, self.crop_height = crop
         self.track_history: dict[int, list[int]] = defaultdict(list)
         self.counted_ids: set[int] = set()
-        self.vehicle_counts = {
-            (vehicle_type, direction): 0
-            for vehicle_type in VehicleType
-            for direction in Direction
-        }
         self.minimum_distances = {
             vehicle_type: max(25, int(self.crop_width * _direction_distance_ratio(vehicle_type)))
             for vehicle_type in VehicleType
@@ -240,20 +329,50 @@ class VehicleCounter:
         vehicle_type: VehicleType,
         count_direction: Direction,
     ) -> None:
+        self._rotate_csv_at_midnight()
         self.counted_ids.add(track_id)
         self.vehicle_counts[(vehicle_type, count_direction)] += 1
-        self.csv_writer.writerow(
+        row = {
+            "id": self.next_record_id,
+            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            "direction": int(count_direction),
+            "vehicle_type": int(vehicle_type),
+            "confidence": f"{confidence:.4f}",
+            **self.base_row,
+        }
+        self.csv_writer.writerow(row)
+        self.csv_file.flush()
+        self.supabase_uploader.submit(
             {
-                "id": self.next_record_id,
-                "timestamp": datetime.now().isoformat(timespec="milliseconds"),
-                "direction": int(count_direction),
-                "vehicle_type": int(vehicle_type),
-                "confidence": f"{confidence:.4f}",
-                **self.base_row,
+                "source_file": self.csv_path.relative_to(Path("outputs")).as_posix(),
+                "record_id": row["id"],
+                "timestamp": row["timestamp"],
+                "direction": row["direction"],
+                "vehicle_type": row["vehicle_type"],
+                "time_of_day": row["time_of_day"],
+                "confidence": float(row["confidence"]),
             }
         )
-        self.csv_file.flush()
         self.next_record_id += 1
+
+    def _rotate_csv_at_midnight(self) -> None:
+        """Switch to a new daily file if the counter continues past midnight."""
+        current_day = datetime.now().date()
+        if current_day == self.csv_day:
+            return
+
+        self.csv_file.close()
+        (
+            self.csv_path,
+            self.csv_file,
+            self.csv_writer,
+            self.vehicle_counts,
+            self.next_record_id,
+        ) = _open_csv_writer(current_day)
+        self.csv_day = current_day
+        self.counted_ids.clear()
+        self.track_history.clear()
+        self.track_last_seen.clear()
 
     def _process_detections(
         self,
@@ -348,6 +467,7 @@ class VehicleCounter:
             self.camera.release()
             cv2.destroyAllWindows()
             self.csv_file.close()
+            self.supabase_uploader.close()
 
 
 def _status_panel(
@@ -523,7 +643,6 @@ class MovingLightTracker:
 
 def main() -> None:
     crop = _select_startup_crop()
-    _wait_for_scheduled_start()
     counter = VehicleCounter(crop)
     counter.run()
 

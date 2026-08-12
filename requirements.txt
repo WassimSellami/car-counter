@@ -3,3 +3,4 @@ ultralytics
 pandas
 plotly
 streamlit
+requests

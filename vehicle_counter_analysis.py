@@ -27,7 +27,7 @@ def parse_arguments() -> argparse.Namespace:
         "csv_files",
         nargs="*",
         type=Path,
-        help="CSV files to analyse. Defaults to every outputs/**/car_counts_*.csv file.",
+        help="CSV files to analyse. Defaults to every current and legacy counter CSV under outputs/.",
     )
     parser.add_argument(
         "--output-dir",
@@ -56,6 +56,19 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def discover_count_csv_files() -> list[Path]:
+    """Find one source per day, preferring the new daily CSV over legacy runs."""
+    output_root = Path("outputs")
+    daily_files = sorted(output_root.glob("**/count_*.csv"))
+    daily_directories = {csv_path.parent for csv_path in daily_files}
+    legacy_files = sorted(
+        csv_path
+        for csv_path in output_root.glob("**/car_counts_*.csv")
+        if csv_path.parent not in daily_directories
+    )
+    return daily_files + legacy_files
+
+
 def load_counts(csv_files: list[Path]) -> pd.DataFrame:
     frames = []
     for csv_file in csv_files:
@@ -65,7 +78,12 @@ def load_counts(csv_files: list[Path]) -> pd.DataFrame:
     if not frames:
         raise ValueError("No CSV files were supplied.")
 
-    data = pd.concat(frames, ignore_index=True)
+    return normalise_counts(pd.concat(frames, ignore_index=True))
+
+
+def normalise_counts(data: pd.DataFrame) -> pd.DataFrame:
+    """Validate and label count rows loaded from a CSV or Supabase."""
+    data = data.copy()
     data["timestamp"] = pd.to_datetime(data["timestamp"], errors="coerce")
     data["direction"] = pd.to_numeric(data["direction"], errors="coerce").map(DIRECTION_LABELS)
     data["vehicle_type"] = pd.to_numeric(data["vehicle_type"], errors="coerce").map(VEHICLE_TYPE_LABELS)
@@ -184,7 +202,7 @@ def save_continuous_flow_chart(
 
 def main() -> None:
     arguments = parse_arguments()
-    csv_files = arguments.csv_files or sorted(Path("outputs").glob("**/car_counts_*.csv"))
+    csv_files = arguments.csv_files or discover_count_csv_files()
     missing = [path for path in csv_files if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"CSV file not found: {missing[0]}")

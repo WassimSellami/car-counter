@@ -3,10 +3,6 @@ CAMERA_INDEX = 0  # Set this to the DroidCam index printed by find_camera.py.
 # offer this resolution; otherwise its driver will use the nearest supported one.
 CAMERA_WIDTH = 1920
 CAMERA_HEIGHT = 1080
-# Detection starts at this local time. Camera and model initialization wait
-# until then, so no GPU inference work happens before the scheduled start.
-DETECTION_START_HOUR = 5
-DETECTION_START_MINUTE = 00
 # Default width for traffic-flow chart buckets.
 CONTINUOUS_FLOW_INTERVAL_MINUTES = 5
 # Use the fast model to preserve a responsive camera preview.
