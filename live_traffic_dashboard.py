@@ -21,7 +21,8 @@ from vehicle_counter_analysis import (
 )
 
 
-REFRESH_INTERVAL_SECONDS = 5
+REFRESH_INTERVAL_SECONDS = 300
+REFRESH_INTERVAL_LABEL = "5 minutes"
 TRACE_NAMES = [
     f"{vehicle_type} — {direction}"
     for vehicle_type in VEHICLE_TYPE_LABELS.values()
@@ -52,27 +53,64 @@ def load_local_data():
     return load_counts(files)
 
 
+def fetch_supabase_rows(
+    url: str,
+    service_key: str,
+    selected_day: date,
+    since_timestamp: str | None = None,
+) -> list[dict]:
+    """Fetch a full day once, or only its newest rows on later refreshes."""
+    next_day = selected_day + timedelta(days=1)
+    rows = []
+    page_size = 1_000
+    offset = 0
+    while True:
+        timestamp_filter = (
+            f"gte.{since_timestamp}"
+            if since_timestamp is not None
+            else f"gte.{selected_day.isoformat()}T00:00:00"
+        )
+        response = requests.get(
+            f"{url.rstrip('/')}/rest/v1/traffic_counts",
+            params=[
+                ("select", "record_id,timestamp,direction,vehicle_type"),
+                ("timestamp", timestamp_filter),
+                ("timestamp", f"lt.{next_day.isoformat()}T00:00:00"),
+                ("order", "timestamp.asc,record_id.asc"),
+                ("limit", page_size),
+                ("offset", offset),
+            ],
+            headers=supabase_headers(service_key),
+            timeout=15,
+        )
+        response.raise_for_status()
+        page = response.json()
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return rows
+
+
 def load_supabase_day(selected_day: date):
     credentials = supabase_credentials()
     if credentials is None:
         return None
     url, service_key = credentials
-    next_day = selected_day + timedelta(days=1)
-    response = requests.get(
-        f"{url.rstrip('/')}/rest/v1/traffic_counts",
-        params=[
-            ("select", "timestamp,direction,vehicle_type"),
-            ("timestamp", f"gte.{selected_day.isoformat()}T00:00:00"),
-            ("timestamp", f"lt.{next_day.isoformat()}T00:00:00"),
-        ],
-        headers=supabase_headers(service_key),
-        timeout=15,
-    )
-    response.raise_for_status()
-    rows = response.json()
-    if not rows:
+    cache_key = f"supabase_rows_{selected_day.isoformat()}"
+    cached_rows = st.session_state.get(cache_key)
+    if cached_rows is None:
+        rows = fetch_supabase_rows(url, service_key, selected_day)
+    else:
+        last_timestamp = cached_rows["timestamp"].max()
+        updates = fetch_supabase_rows(url, service_key, selected_day, last_timestamp)
+        rows = pd.concat([cached_rows, pd.DataFrame(updates)], ignore_index=True)
+        rows = rows.drop_duplicates(subset="record_id", keep="last")
+    raw_data = rows if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
+    if raw_data.empty:
         return None
-    return normalise_counts(pd.DataFrame(rows))
+    st.session_state[cache_key] = raw_data
+    return normalise_counts(raw_data)
 
 
 def latest_day() -> date:
@@ -96,7 +134,7 @@ def latest_day() -> date:
 
 st.set_page_config(page_title="Live traffic flow", layout="wide")
 st.title("Live traffic flow")
-st.caption(f"The selected day refreshes every {REFRESH_INTERVAL_SECONDS} seconds while this page is open.")
+st.caption(f"The selected day refreshes every {REFRESH_INTERVAL_LABEL} while this page is open.")
 
 selected_day = st.date_input("Day", value=latest_day())
 visible_traces = st.multiselect(

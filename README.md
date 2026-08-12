@@ -62,7 +62,7 @@ streamlit run live_traffic_dashboard.py
 Streamlit opens the dashboard in your browser (normally at
 `http://localhost:8501`). Choose a day with the date picker, then use the
 `Shown lines` selector to show or hide individual lines. These choices remain
-applied while the graph refreshes every five seconds.
+applied while the graph refreshes every five minutes.
 
 ### Supabase cloud sync
 
