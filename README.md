@@ -60,7 +60,10 @@ streamlit run live_traffic_dashboard.py
 ```
 
 Streamlit opens the dashboard in your browser (normally at
-`http://localhost:8501`). Choose a day with the date picker, then use the
+`http://localhost:8501`). Choose a day with the date picker, then drag the two
+handles on the object-count timeframe slider to select its start and end time;
+the handles are limited to the available data for that day.
+The object-count panel shows each vehicle type split by direction. Use the
 `Shown lines` selector to show or hide individual lines. These choices remain
 applied while the graph refreshes every five minutes.
 

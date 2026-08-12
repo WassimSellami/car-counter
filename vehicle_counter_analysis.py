@@ -93,7 +93,12 @@ def normalise_counts(data: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
-def build_continuous_flow_figure(data: pd.DataFrame, interval_minutes: int, smoothing_window: int = 3):
+def build_continuous_flow_figure(
+    data: pd.DataFrame,
+    interval_minutes: int,
+    smoothing_window: int = 3,
+    vehicle_types: tuple[str, ...] | None = None,
+):
     """Build a Plotly figure with one togglable trace per vehicle/direction."""
     if interval_minutes < 1:
         raise ValueError("--interval-minutes must be at least 1.")
@@ -112,7 +117,8 @@ def build_continuous_flow_figure(data: pd.DataFrame, interval_minutes: int, smoo
 
     figure = go.Figure()
 
-    for vehicle_type in VEHICLE_TYPE_LABELS.values():
+    displayed_vehicle_types = vehicle_types or tuple(VEHICLE_TYPE_LABELS.values())
+    for vehicle_type in displayed_vehicle_types:
         for direction, line_style in (("Into Passau", "-"), ("Out of Passau", "--")):
             series = grouped.reindex(
                 pd.MultiIndex.from_product(

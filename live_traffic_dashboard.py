@@ -5,7 +5,7 @@ Start with: streamlit run live_traffic_dashboard.py
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import requests
@@ -26,6 +26,7 @@ REFRESH_INTERVAL_LABEL = "5 minutes"
 TRACE_NAMES = [
     f"{vehicle_type} — {direction}"
     for vehicle_type in VEHICLE_TYPE_LABELS.values()
+    if vehicle_type != "Bicycle"
     for direction in ("Into Passau", "Out of Passau")
 ]
 
@@ -132,6 +133,44 @@ def latest_day() -> date:
     return local_data["timestamp"].dt.date.max() if local_data is not None else date.today()
 
 
+def data_for_count_timeframe(
+    data: pd.DataFrame, timeframe: tuple[datetime, datetime]
+) -> tuple[pd.DataFrame, str]:
+    """Return count rows between the two handles on the selected day."""
+    start_time, end_time = timeframe
+    return (
+        data.loc[data["timestamp"].between(start_time, end_time)].copy(),
+        f"{start_time:%H:%M}–{end_time:%H:%M}",
+    )
+
+
+def render_object_counts(data: pd.DataFrame, timeframe: tuple[datetime, datetime]) -> None:
+    """Show the same type-and-direction totals as the camera status panel."""
+    timeframe_data, timeframe_label = data_for_count_timeframe(data, timeframe)
+    counts = timeframe_data.groupby(["vehicle_type", "direction"]).size()
+
+    st.subheader("Object counts")
+    st.caption(f"Counts for {timeframe_label} on the selected day.")
+    header = st.columns([1.4, 1, 1])
+    header[0].markdown("**Type**")
+    header[1].markdown("**Out of Passau**")
+    header[2].markdown("**Into Passau**")
+
+    for vehicle_type in VEHICLE_TYPE_LABELS.values():
+        row = st.columns([1.4, 1, 1])
+        row[0].markdown(f"**{vehicle_type}**")
+        row[1].metric(
+            "Out of Passau",
+            counts.get((vehicle_type, "Out of Passau"), 0),
+            label_visibility="collapsed",
+        )
+        row[2].metric(
+            "Into Passau",
+            counts.get((vehicle_type, "Into Passau"), 0),
+            label_visibility="collapsed",
+        )
+
+
 st.set_page_config(page_title="Live traffic flow", layout="wide")
 st.title("Live traffic flow")
 st.caption(f"The selected day refreshes every {REFRESH_INTERVAL_LABEL} while this page is open.")
@@ -159,7 +198,16 @@ def render_live_chart() -> None:
         st.info(f"No counted vehicles for {selected_day.isoformat()} yet.")
         return
 
-    figure = build_continuous_flow_figure(day_data, CONTINUOUS_FLOW_INTERVAL_MINUTES)
+    main_vehicle_types = tuple(
+        vehicle_type
+        for vehicle_type in VEHICLE_TYPE_LABELS.values()
+        if vehicle_type != "Bicycle"
+    )
+    figure = build_continuous_flow_figure(
+        day_data,
+        CONTINUOUS_FLOW_INTERVAL_MINUTES,
+        vehicle_types=main_vehicle_types,
+    )
     for trace in figure.data:
         trace.visible = trace.legendgroup in visible_traces
 
@@ -178,12 +226,61 @@ def render_live_chart() -> None:
         use_container_width=True,
         config={"responsive": True},
     )
+    bicycle_figure = build_continuous_flow_figure(
+        day_data,
+        CONTINUOUS_FLOW_INTERVAL_MINUTES,
+        vehicle_types=("Bicycle",),
+    )
+    bicycle_figure.update_layout(
+        title=(
+            f"Bicycle flow every {CONTINUOUS_FLOW_INTERVAL_MINUTES} minutes "
+            f"(15-minute rolling average) — {selected_day:%d %b %Y}"
+        )
+    )
+    st.plotly_chart(
+        bicycle_figure,
+        key=f"bicycle-flow-{selected_day.isoformat()}",
+        use_container_width=True,
+        config={"responsive": True},
+    )
     st.caption(
         f"{len(day_data):,} vehicles loaded; latest count: "
         f"{day_data['timestamp'].max():%d %b %Y, %H:%M:%S}. "
         "Bold lines are 15-minute rolling averages; faint lines are raw five-minute counts. "
         "Use the Shown lines selector above to show or hide both."
     )
+
+    st.divider()
+    count_panel, _ = st.columns([1, 2])
+    with count_panel:
+        available_start = day_data["timestamp"].min().to_pydatetime()
+        available_end = day_data["timestamp"].max().to_pydatetime()
+        if available_start == available_end:
+            st.caption(f"Only one count is available at {available_start:%H:%M}.")
+            count_timeframe = (available_start, available_end)
+        else:
+            slider_key = f"object_count_timeframe_{selected_day.isoformat()}"
+            if slider_key not in st.session_state:
+                st.session_state[slider_key] = (available_start, available_end)
+            else:
+                saved_start, saved_end = st.session_state[slider_key]
+                bounded_start = max(available_start, min(saved_start, available_end))
+                bounded_end = max(available_start, min(saved_end, available_end))
+                st.session_state[slider_key] = (
+                    (available_start, available_end)
+                    if bounded_start > bounded_end
+                    else (bounded_start, bounded_end)
+                )
+            count_timeframe = st.slider(
+                "Object-count timeframe",
+                min_value=available_start,
+                max_value=available_end,
+                step=timedelta(minutes=15),
+                format="HH:mm",
+                help="Drag the two handles to choose the start and end of the available count data.",
+                key=slider_key,
+            )
+        render_object_counts(day_data, count_timeframe)
 
 
 render_live_chart()
