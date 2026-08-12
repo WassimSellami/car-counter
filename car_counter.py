@@ -2,7 +2,7 @@
 
 from collections import defaultdict
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 from pathlib import Path
 import time
@@ -23,6 +23,8 @@ from constants import (
     CAMERA_WIDTH,
     CAR_CLASS_ID,
     CONFIDENCE,
+    DETECTION_START_HOUR,
+    DETECTION_START_MINUTE,
     IMAGE_SIZE,
     LIGHT_BRIGHTNESS_THRESHOLD,
     LIGHT_GROUP_X_DISTANCE,
@@ -83,8 +85,58 @@ def _open_csv_writer(program_started_at: datetime) -> tuple[Path, TextIO, csv.Di
     return csv_path, csv_file, csv_writer
 
 
+def _wait_for_scheduled_start() -> None:
+    """Wait until the next configured local start time without using the GPU."""
+    now = datetime.now()
+    start_at = now.replace(
+        hour=DETECTION_START_HOUR,
+        minute=DETECTION_START_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    if now > start_at:
+        start_at += timedelta(days=1)
+
+    remaining_seconds = (start_at - now).total_seconds()
+    if remaining_seconds <= 0:
+        return
+
+    print(f"Waiting until {start_at:%Y-%m-%d %H:%M} local time to start detection.")
+    while remaining_seconds > 0:
+        time.sleep(min(remaining_seconds, 60.0))
+        remaining_seconds = (start_at - datetime.now()).total_seconds()
+
+
+def _select_startup_crop() -> tuple[int, int, int, int]:
+    """Show the camera preview and choose the crop before scheduled detection."""
+    camera = open_camera(CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT)
+    if not camera.isOpened():
+        raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
+
+    try:
+        while True:
+            success, frame = camera.read()
+            if not success:
+                raise RuntimeError("Could not read a frame from the camera")
+
+            if not SELECT_CROP_ON_START:
+                frame_height, frame_width = frame.shape[:2]
+                return 0, 0, frame_width, frame_height
+
+            cv2.imshow("Camera Preview", frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("s"):
+                cv2.destroyWindow("Camera Preview")
+                return _select_crop(frame)
+            if key == ord("q"):
+                raise SystemExit(0)
+    finally:
+        camera.release()
+        cv2.destroyAllWindows()
+
+
 class VehicleCounter:
-    def __init__(self) -> None:
+    def __init__(self, crop: tuple[int, int, int, int]) -> None:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = None if NIGHT_MODE else YOLO(MODEL_PATH)
         if self.model is not None:
@@ -93,16 +145,12 @@ class VehicleCounter:
         self.program_started_at = datetime.now()
         self.csv_path, self.csv_file, self.csv_writer = _open_csv_writer(self.program_started_at)
         self.next_record_id = 1
-        self.camera = open_camera(CAMERA_INDEX)
+        self.camera = open_camera(CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT)
         if not self.camera.isOpened():
             self.csv_file.close()
             raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
 
-        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-        self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        self.crop_x, self.crop_y, self.crop_width, self.crop_height = self._select_initial_crop()
+        self.crop_x, self.crop_y, self.crop_width, self.crop_height = crop
         self.track_history: dict[int, list[int]] = defaultdict(list)
         self.counted_ids: set[int] = set()
         self.vehicle_counts = {
@@ -131,34 +179,6 @@ class VehicleCounter:
             assert self.light_tracker is not None
         else:
             assert self.model is not None
-
-    def _select_initial_crop(self) -> tuple[int, int, int, int]:
-        if SELECT_CROP_ON_START:
-            while True:
-                success, first_frame = self.camera.read()
-                if not success:
-                    self.camera.release()
-                    raise RuntimeError("Could not read a frame from the camera")
-
-                cv2.imshow("Camera Preview", first_frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("s"):
-                    break
-                if key == ord("q"):
-                    self.camera.release()
-                    cv2.destroyAllWindows()
-                    self.csv_file.close()
-                    raise SystemExit(0)
-
-            cv2.destroyWindow("Camera Preview")
-            return _select_crop(first_frame)
-
-        success, first_frame = self.camera.read()
-        if not success:
-            self.camera.release()
-            raise RuntimeError("Could not read a frame from the camera")
-        frame_height, frame_width = first_frame.shape[:2]
-        return 0, 0, frame_width, frame_height
 
     def _read_detections(
         self, frame: np.ndarray
@@ -502,7 +522,9 @@ class MovingLightTracker:
 
 
 def main() -> None:
-    counter = VehicleCounter()
+    crop = _select_startup_crop()
+    _wait_for_scheduled_start()
+    counter = VehicleCounter(crop)
     counter.run()
 
 if __name__ == "__main__":

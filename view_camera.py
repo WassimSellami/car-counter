@@ -12,13 +12,9 @@ MEASUREMENT_SECONDS = 5
 
 
 def main() -> None:
-    camera = open_camera(CAMERA_INDEX)
+    camera = open_camera(CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT)
     if not camera.isOpened():
         raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
-
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-    camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     try:
         print(f"Measuring the feed for {MEASUREMENT_SECONDS} seconds...")

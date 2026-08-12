@@ -1,8 +1,14 @@
 CAMERA_INDEX = 0  # Set this to the DroidCam index printed by find_camera.py.
 # Requested DroidCam capture resolution. DroidCam must also be configured to
 # offer this resolution; otherwise its driver will use the nearest supported one.
-CAMERA_WIDTH = 1280
-CAMERA_HEIGHT = 720
+CAMERA_WIDTH = 1920
+CAMERA_HEIGHT = 1080
+# Detection starts at this local time. Camera and model initialization wait
+# until then, so no GPU inference work happens before the scheduled start.
+DETECTION_START_HOUR = 5
+DETECTION_START_MINUTE = 00
+# Default width for traffic-flow chart buckets.
+CONTINUOUS_FLOW_INTERVAL_MINUTES = 5
 # Use the fast model to preserve a responsive camera preview.
 MODEL_PATH = "yolo11s.pt"
 BICYCLE_CLASS_ID = 1  # COCO class ID for bicycles.
@@ -23,7 +29,7 @@ BICYCLE_CONFIDENCE = 0.10
 # whether each one was accepted or rejected by the threshold above.
 # Keep low-score candidates visible so the per-type thresholds can accept them.
 MODEL_CONFIDENCE = 0.05
-IMAGE_SIZE = 960
+IMAGE_SIZE = 640  # YOLO input image size. Must be a multiple of 32.
 # Maximum total detections retained per frame across every vehicle type.
 MAX_DETECTIONS = 15
 # Forget tracker IDs that have not appeared for this long. This prevents

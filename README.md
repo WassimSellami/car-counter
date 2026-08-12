@@ -31,20 +31,38 @@ Each run creates a CSV file at `outputs/YYYY-MM-DD/car_counts_YYYYMMDD_HHMMSS.cs
 
 ## Traffic analysis
 
-Generate direction and vehicle-type charts from every recorded CSV with:
+Generate one standalone interactive traffic-flow report per calendar day with:
 
 ```powershell
 pip install -r requirements.txt
 python vehicle_counter_analysis.py
 ```
 
-The script deliberately ignores `confidence` and `time_of_day`. It writes these charts plus a `summary.csv` to `outputs/analysis/`:
+The script deliberately ignores `confidence` and `time_of_day`. It creates one
+self-contained interactive HTML report per calendar day, for example
+`outputs/analysis/traffic_flow_2026-08-12.html`; open it directly in any
+browser—no server is needed. The legend contains one entry for each vehicle
+type and direction, so clicking (for example) `Truck — Into Passau` shows or
+hides that line. The chart uses five-minute buckets by default, with category
+colours, solid Into-Passau lines, and dashed Out-of-Passau lines. A faint line
+shows the raw five-minute count and a bold line shows a centred 15-minute
+rolling average; change the smoothing width with `--smoothing-window` (use `1`
+for no smoothing). The chart ends at the last recorded interval, so it does not
+add a trailing drop to zero.
 
-- hourly stacked direction flow;
-- hourly stacked vehicle types;
-- continuous 30-minute flow with smoothed lines: category colour, solid right-bound line, and dashed left-bound line;
-- direction × vehicle-type heatmap;
-- vehicle-mix pie charts for left- and right-bound traffic.
+### Live dashboard
+
+To watch one selected calendar day update while `car_counter.py` is running,
+open another PowerShell window and run:
+
+```powershell
+streamlit run live_traffic_dashboard.py
+```
+
+Streamlit opens the dashboard in your browser (normally at
+`http://localhost:8501`). Choose a day with the date picker, then use the
+`Shown lines` selector to show or hide individual lines. These choices remain
+applied while the graph refreshes every five seconds.
 
 To analyse only selected runs, pass their file paths, for example:
 
