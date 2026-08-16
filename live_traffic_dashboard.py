@@ -11,7 +11,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from constants import CONTINUOUS_FLOW_INTERVAL_MINUTES
+from constants import CONTINUOUS_FLOW_INTERVAL_MINUTES, CONTINUOUS_FLOW_ROLLING_AVERAGE_MINUTES
 from vehicle_counter_analysis import (
     VEHICLE_TYPE_LABELS,
     build_continuous_flow_figure,
@@ -214,7 +214,7 @@ def render_live_chart() -> None:
     figure.update_layout(
         title=(
             f"Traffic flow every {CONTINUOUS_FLOW_INTERVAL_MINUTES} minutes "
-            f"(15-minute rolling average) — {selected_day:%d %b %Y}"
+            f"({CONTINUOUS_FLOW_ROLLING_AVERAGE_MINUTES}-minute rolling average) — {selected_day:%d %b %Y}"
         ),
         # Streamlit reruns cannot receive Plotly legend clicks from the browser.
         # The persistent "Shown lines" selector above owns trace visibility instead.
@@ -234,7 +234,7 @@ def render_live_chart() -> None:
     bicycle_figure.update_layout(
         title=(
             f"Bicycle flow every {CONTINUOUS_FLOW_INTERVAL_MINUTES} minutes "
-            f"(15-minute rolling average) — {selected_day:%d %b %Y}"
+            f"({CONTINUOUS_FLOW_ROLLING_AVERAGE_MINUTES}-minute rolling average) — {selected_day:%d %b %Y}"
         )
     )
     st.plotly_chart(
@@ -246,8 +246,8 @@ def render_live_chart() -> None:
     st.caption(
         f"{len(day_data):,} vehicles loaded; latest count: "
         f"{day_data['timestamp'].max():%d %b %Y, %H:%M:%S}. "
-        "Bold lines are 15-minute rolling averages; faint lines are raw five-minute counts. "
-        "Use the Shown lines selector above to show or hide both."
+        f"Lines use a {CONTINUOUS_FLOW_ROLLING_AVERAGE_MINUTES}-minute rolling average. "
+        "Use the Shown lines selector above to show or hide them."
     )
 
     st.divider()

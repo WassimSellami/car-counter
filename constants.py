@@ -1,10 +1,15 @@
+START_IMMEDIATELY = True
+START_HOURS = 5
+START_MINUTES = 15
 CAMERA_INDEX = 0  # Set this to the DroidCam index printed by find_camera.py.
 # Requested DroidCam capture resolution. DroidCam must also be configured to
 # offer this resolution; otherwise its driver will use the nearest supported one.
 CAMERA_WIDTH = 1920
 CAMERA_HEIGHT = 1080
 # Default width for traffic-flow chart buckets.
-CONTINUOUS_FLOW_INTERVAL_MINUTES = 5
+CONTINUOUS_FLOW_INTERVAL_MINUTES = 20
+# Fixed duration for the centred traffic-flow rolling average.
+CONTINUOUS_FLOW_ROLLING_AVERAGE_MINUTES = 120
 # Use the fast model to preserve a responsive camera preview.
 MODEL_PATH = "yolo11s.pt"
 BICYCLE_CLASS_ID = 1  # COCO class ID for bicycles.

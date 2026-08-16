@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from constants import CONTINUOUS_FLOW_INTERVAL_MINUTES
+from constants import CONTINUOUS_FLOW_INTERVAL_MINUTES, CONTINUOUS_FLOW_ROLLING_AVERAGE_MINUTES
 
 
 DIRECTION_LABELS = {0: "Out of Passau", 1: "Into Passau"}
@@ -42,15 +42,6 @@ def parse_arguments() -> argparse.Namespace:
         help=(
             "Width of each continuous time-series bucket in minutes "
             f"(default: {CONTINUOUS_FLOW_INTERVAL_MINUTES})."
-        ),
-    )
-    parser.add_argument(
-        "--smoothing-window",
-        type=int,
-        default=3,
-        help=(
-            "Number of time buckets in the centred rolling average "
-            "(default: 3; use 1 to disable smoothing)."
         ),
     )
     return parser.parse_args()
@@ -96,15 +87,11 @@ def normalise_counts(data: pd.DataFrame) -> pd.DataFrame:
 def build_continuous_flow_figure(
     data: pd.DataFrame,
     interval_minutes: int,
-    smoothing_window: int = 3,
     vehicle_types: tuple[str, ...] | None = None,
 ):
     """Build a Plotly figure with one togglable trace per vehicle/direction."""
     if interval_minutes < 1:
         raise ValueError("--interval-minutes must be at least 1.")
-    if smoothing_window < 1:
-        raise ValueError("--smoothing-window must be at least 1.")
-
     frequency = f"{interval_minutes}min"
     buckets = pd.date_range(
         data["timestamp"].min().floor(frequency),
@@ -128,40 +115,24 @@ def build_continuous_flow_figure(
                 fill_value=0,
             )
             values = series.to_numpy(dtype=float)
-            smoothed_values = (
-                pd.Series(values)
-                .rolling(window=smoothing_window, center=True, min_periods=1)
+            hourly_values = (
+                pd.Series(values, index=buckets)
+                .rolling(
+                    window=f"{CONTINUOUS_FLOW_ROLLING_AVERAGE_MINUTES}min",
+                    center=True,
+                    min_periods=1,
+                )
                 .mean()
                 .to_numpy()
+                * 60
+                / interval_minutes
             )
             trace_name = f"{vehicle_type} — {direction}"
 
             figure.add_trace(
                 go.Scatter(
                     x=buckets,
-                    y=values,
-                    mode="lines",
-                    name=f"{trace_name} (raw)",
-                    legendgroup=trace_name,
-                    showlegend=False,
-                    line={
-                        "color": VEHICLE_COLORS[vehicle_type],
-                        "dash": "solid" if line_style == "-" else "dash",
-                        "width": 1,
-                    },
-                    opacity=0.25,
-                    hovertemplate=(
-                        f"{trace_name} (raw)<br>"
-                        "%{x|%d %b %Y, %H:%M}<br>"
-                        "Vehicles: %{y}<extra></extra>"
-                    ),
-                    customdata=[trace_name] * len(buckets),
-                )
-            )
-            figure.add_trace(
-                go.Scatter(
-                    x=buckets,
-                    y=smoothed_values,
+                    y=hourly_values,
                     mode="lines",
                     name=trace_name,
                     legendgroup=trace_name,
@@ -169,12 +140,10 @@ def build_continuous_flow_figure(
                         "color": VEHICLE_COLORS[vehicle_type],
                         "dash": "solid" if line_style == "-" else "dash",
                         "width": 3,
+                        "shape": "spline",
+                        "smoothing": 1.2,
                     },
-                    hovertemplate=(
-                        f"{trace_name} (smoothed)<br>"
-                        "%{x|%d %b %Y, %H:%M}<br>"
-                        "Average vehicles: %{y:.1f}<extra></extra>"
-                    ),
+                    hovertemplate=f"{trace_name}: %{{y:.1f}}/hour<extra></extra>",
                     customdata=[trace_name] * len(buckets),
                 )
             )
@@ -182,23 +151,21 @@ def build_continuous_flow_figure(
     figure.update_layout(
         title=(
             f"Traffic flow every {interval_minutes} minutes "
-            f"(smoothed over {interval_minutes * smoothing_window} minutes)"
+            f"({CONTINUOUS_FLOW_ROLLING_AVERAGE_MINUTES}-minute rolling average)"
         ),
         template="plotly_white",
         hovermode="x unified",
         legend={"title": "Click a series to show or hide it"},
         xaxis={"title": "Time", "hoverformat": "%d %b %Y, %H:%M"},
-        yaxis={"title": "Counted vehicles per interval", "rangemode": "tozero"},
+        yaxis={"title": "Vehicles per hour", "rangemode": "tozero"},
         margin={"l": 70, "r": 30, "t": 80, "b": 70},
     )
     return figure
 
 
-def save_continuous_flow_chart(
-    data: pd.DataFrame, output_dir: Path, interval_minutes: int, smoothing_window: int
-) -> Path:
+def save_continuous_flow_chart(data: pd.DataFrame, output_dir: Path, interval_minutes: int) -> Path:
     """Write a self-contained interactive Plotly report for one calendar day."""
-    figure = build_continuous_flow_figure(data, interval_minutes, smoothing_window)
+    figure = build_continuous_flow_figure(data, interval_minutes)
     day_key = data["timestamp"].dt.strftime("%Y-%m-%d").iloc[0]
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"traffic_flow_{day_key}.html"
@@ -219,7 +186,6 @@ def main() -> None:
             day_data,
             arguments.output_dir,
             arguments.interval_minutes,
-            arguments.smoothing_window,
         )
         for _, day_data in data.groupby(data["timestamp"].dt.date, sort=True)
     ]

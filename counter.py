@@ -2,7 +2,7 @@
 
 from collections import defaultdict
 import csv
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import logging
 import os
 from pathlib import Path
@@ -42,6 +42,9 @@ from constants import (
     MODEL_PATH,
     NIGHT_MODE,
     SELECT_CROP_ON_START,
+    START_HOURS,
+    START_IMMEDIATELY,
+    START_MINUTES,
     TRACK_MEMORY_SECONDS,
     TRUCK_CLASS_ID,
     VEHICLE_CLASS_IDS,
@@ -219,6 +222,22 @@ def _select_startup_crop() -> tuple[int, int, int, int]:
     finally:
         camera.release()
         cv2.destroyAllWindows()
+
+
+def _wait_for_scheduled_start() -> None:
+    """Wait for the next configured start time unless immediate start is enabled."""
+    if START_IMMEDIATELY:
+        return
+    if not 0 <= START_HOURS <= 23 or not 0 <= START_MINUTES <= 59:
+        raise ValueError("START_HOURS must be 0-23 and START_MINUTES must be 0-59")
+
+    now = datetime.now()
+    start_time = now.replace(hour=START_HOURS, minute=START_MINUTES, second=0, microsecond=0)
+    if start_time <= now:
+        start_time += timedelta(days=1)
+    print(f"Crop saved. Counting will start at {start_time:%Y-%m-%d %H:%M}.")
+    while (remaining := (start_time - datetime.now()).total_seconds()) > 0:
+        time.sleep(min(remaining, 60))
 
 
 class VehicleCounter:
@@ -643,6 +662,7 @@ class MovingLightTracker:
 
 def main() -> None:
     crop = _select_startup_crop()
+    _wait_for_scheduled_start()
     counter = VehicleCounter(crop)
     counter.run()
 

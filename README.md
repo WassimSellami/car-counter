@@ -44,10 +44,8 @@ self-contained interactive HTML report per calendar day, for example
 browser—no server is needed. The legend contains one entry for each vehicle
 type and direction, so clicking (for example) `Truck — Into Passau` shows or
 hides that line. The chart uses five-minute buckets by default, with category
-colours, solid Into-Passau lines, and dashed Out-of-Passau lines. A faint line
-shows the raw five-minute count and a bold line shows a centred 15-minute
-rolling average; change the smoothing width with `--smoothing-window` (use `1`
-for no smoothing). The chart ends at the last recorded interval, so it does not
+colours, solid Into-Passau lines, and dashed Out-of-Passau lines. Each line is
+a centred two-hour rolling average. The chart ends at the last recorded interval, so it does not
 add a trailing drop to zero.
 
 ### Live dashboard
