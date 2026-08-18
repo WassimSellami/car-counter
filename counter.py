@@ -1,21 +1,19 @@
 """Count detected cars once based on their horizontal travel direction."""
 
-from collections import defaultdict
+from collections import defaultdict, deque
 import csv
 from datetime import date, datetime, timedelta
 import logging
 import os
 from pathlib import Path
-from queue import Queue
-from threading import Thread
+from queue import Empty, Full, Queue
+from threading import Event, Thread
 import time
 from typing import TextIO
 
 import cv2
 import numpy as np
 import requests
-import torch
-from ultralytics import YOLO
 
 from constants import (
     BICYCLE_CLASS_ID,
@@ -23,11 +21,13 @@ from constants import (
     BICYCLE_DIRECTION_DISTANCE_RATIO,
     BUS_CLASS_ID,
     CAMERA_HEIGHT,
-    CAMERA_INDEX,
+    CAMERA_SOURCE,
     CAMERA_WIDTH,
     CAR_CLASS_ID,
+    CLOUD_BATCH_SIZE,
     CONFIDENCE,
-    IMAGE_SIZE,
+    DISPLAY_BUFFER_FRAMES,
+    DISPLAY_FPS,
     LIGHT_BRIGHTNESS_THRESHOLD,
     LIGHT_GROUP_X_DISTANCE,
     LIGHT_GROUP_Y_DISTANCE,
@@ -36,10 +36,7 @@ from constants import (
     LIGHT_MIN_AREA,
     LIGHT_TRACK_DISTANCE,
     LIGHT_TRACK_MAX_MISSING,
-    MAX_DETECTIONS,
     MIN_DIRECTION_DISTANCE_RATIO,
-    MODEL_CONFIDENCE,
-    MODEL_PATH,
     NIGHT_MODE,
     SELECT_CROP_ON_START,
     START_HOURS,
@@ -47,9 +44,10 @@ from constants import (
     START_MINUTES,
     TRACK_MEMORY_SECONDS,
     TRUCK_CLASS_ID,
-    VEHICLE_CLASS_IDS,
+    UPLOAD_TO_SUPABASE,
 )
 from camera_utils import open_camera
+from cloud_detection_client import INFERENCE_WIDTH, JPEG_QUALITY, infer_frame_batch
 from enums import Direction, TimeOfDay, VehicleType
 
 logging.getLogger("ultralytics").disabled = True
@@ -101,7 +99,7 @@ class SupabaseCountUploader:
         self.service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
         self.queue: Queue[dict | None] = Queue()
         self.worker: Thread | None = None
-        if self.url and self.service_key:
+        if UPLOAD_TO_SUPABASE and self.url and self.service_key:
             self.worker = Thread(target=self._upload_loop, daemon=True)
             self.worker.start()
 
@@ -198,9 +196,9 @@ def _open_csv_writer(day: date) -> tuple[Path, TextIO, csv.DictWriter, dict[tupl
 
 def _select_startup_crop() -> tuple[int, int, int, int]:
     """Show the camera preview and choose the crop before scheduled detection."""
-    camera = open_camera(CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT)
+    camera = open_camera(CAMERA_SOURCE, CAMERA_WIDTH, CAMERA_HEIGHT)
     if not camera.isOpened():
-        raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
+        raise RuntimeError(f"Could not open camera source {CAMERA_SOURCE}")
 
     try:
         while True:
@@ -242,10 +240,15 @@ def _wait_for_scheduled_start() -> None:
 
 class VehicleCounter:
     def __init__(self, crop: tuple[int, int, int, int]) -> None:
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = None if NIGHT_MODE else YOLO(MODEL_PATH)
-        if self.model is not None:
-            self.model.to(self.device)
+        _load_dotenv()
+        self.cloud_url = os.environ.get("CLOUD_INFERENCE_URL", "")
+        self.cloud_batch_url = self.cloud_url.rsplit("/", 1)[0] + "/infer-batch" if self.cloud_url else ""
+        self.cloud_headers = {"X-API-Key": os.environ.get("CLOUD_INFERENCE_API_KEY", "")}
+        self.cloud_session = requests.Session()
+        if not 1 <= CLOUD_BATCH_SIZE <= 12:
+            raise ValueError("CLOUD_BATCH_SIZE must be between 1 and 12")
+        if not NIGHT_MODE and (not self.cloud_url or not self.cloud_headers["X-API-Key"]):
+            raise RuntimeError("Set CLOUD_INFERENCE_URL and CLOUD_INFERENCE_API_KEY in .env")
         self.light_tracker = MovingLightTracker() if NIGHT_MODE else None
         self.program_started_at = datetime.now()
         self.csv_day = self.program_started_at.date()
@@ -257,11 +260,11 @@ class VehicleCounter:
             self.next_record_id,
         ) = _open_csv_writer(self.csv_day)
         self.supabase_uploader = SupabaseCountUploader()
-        self.camera = open_camera(CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT)
+        self.camera = open_camera(CAMERA_SOURCE, CAMERA_WIDTH, CAMERA_HEIGHT)
         if not self.camera.isOpened():
             self.csv_file.close()
             self.supabase_uploader.close()
-            raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
+            raise RuntimeError(f"Could not open camera source {CAMERA_SOURCE}")
 
         self.crop_x, self.crop_y, self.crop_width, self.crop_height = crop
         self.track_history: dict[int, list[int]] = defaultdict(list)
@@ -280,66 +283,71 @@ class VehicleCounter:
         }
         self.track_last_seen: dict[int, float] = {}
         self.fps = 0.0
-        self.previous_frame_time = time.perf_counter()
-        self.last_track_cleanup_time = self.previous_frame_time
+        self.render_fps = 0.0
+        self.rendered_frame_times: deque[float] = deque()
+        self.cloud_delay_ms = 0.0
+        self.yolo_ms = 0.0
+        self.local_ms = 0.0
+        self.capture_queue: Queue[tuple[np.ndarray, float]] = Queue(maxsize=CLOUD_BATCH_SIZE * 3)
+        self.display_queue: Queue[np.ndarray] = Queue(maxsize=CLOUD_BATCH_SIZE * 3)
+        self.stop_event = Event()
+        self.capture_finished = Event()
+        self.inference_finished = Event()
+        self.cloud_error: str | None = None
+        self.last_track_cleanup_time = time.perf_counter()
 
         if NIGHT_MODE:
             assert self.light_tracker is not None
-        else:
-            assert self.model is not None
 
-    def _read_detections(
-        self, frame: np.ndarray
-    ) -> list[tuple[tuple[float, float, float, float], int | None, float, VehicleType]]:
+    def _read_detection_batches(
+        self, frames: list[np.ndarray]
+    ) -> list[list[tuple[tuple[float, float, float, float], int | None, float, VehicleType]]]:
         if NIGHT_MODE:
             assert self.light_tracker is not None
             return [
-                (
-                    (float(box[0]), float(box[1]), float(box[2]), float(box[3])),
-                    track_id,
-                    1.0,
-                    VehicleType.CAR,
-                )
-                for box, track_id in self.light_tracker.update(frame)
+                [
+                    (
+                        (float(box[0]), float(box[1]), float(box[2]), float(box[3])),
+                        track_id,
+                        1.0,
+                        VehicleType.CAR,
+                    )
+                    for box, track_id in self.light_tracker.update(frame)
+                ]
+                for frame in frames
             ]
 
-        assert self.model is not None
-        result = self.model.track(
-            frame,
-            persist=True,
-            tracker="vehicle_bytetrack.yaml",
-            classes=VEHICLE_CLASS_IDS,
-            conf=MODEL_CONFIDENCE,
-            imgsz=IMAGE_SIZE,
-            max_det=MAX_DETECTIONS,
-            device=self.device,
-            verbose=False,
-        )[0]
-        detections: list[tuple[tuple[float, float, float, float], int | None, float, VehicleType]] = []
-        if result.boxes is not None:
-            boxes: list[tuple[float, float, float, float]] = [
-                (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
-                for box in result.boxes.xyxy.cpu().numpy()
-            ]
-            confidences = [float(value) for value in result.boxes.conf.cpu().numpy().tolist()]
-            class_ids = [int(value) for value in result.boxes.cls.cpu().numpy().tolist()]
-            track_ids = (
-                [int(value) for value in result.boxes.id.cpu().numpy().tolist()]
-                if result.boxes.id is not None
-                else [None] * len(boxes)
+        detection_batches, dimensions, cloud_delay, yolo_ms = infer_frame_batch(
+            self.cloud_session,
+            frames,
+            self.cloud_batch_url,
+            self.cloud_headers,
+            INFERENCE_WIDTH,
+            JPEG_QUALITY,
+        )
+        self.cloud_delay_ms = cloud_delay * 1000
+        self.yolo_ms = yolo_ms
+        if detection_batches and detection_batches[0] and "track_id" not in detection_batches[0][0]:
+            raise RuntimeError(
+                "Cloud server is outdated. Upload and restart vast_inference_server.py."
             )
-            detections = [
+        return [
+            [
                 (
-                    box,
-                    track_id,
-                    confidence,
-                    self.class_to_vehicle_type[class_id],
+                    (
+                        detection["xyxy"][0] * frame.shape[1] / inference_width,
+                        detection["xyxy"][1] * frame.shape[0] / inference_height,
+                        detection["xyxy"][2] * frame.shape[1] / inference_width,
+                        detection["xyxy"][3] * frame.shape[0] / inference_height,
+                    ),
+                    detection["track_id"],
+                    detection["confidence"],
+                    self.class_to_vehicle_type[detection["class_id"]],
                 )
-                for box, track_id, confidence, class_id in zip(
-                    boxes, track_ids, confidences, class_ids
-                )
+                for detection in detections
             ]
-        return detections
+            for frame, detections, (inference_width, inference_height) in zip(frames, detection_batches, dimensions)
+        ]
 
     def _record_count(
         self,
@@ -401,7 +409,6 @@ class VehicleCounter:
     ) -> None:
         if not detections:
             return
-
         for box, track_id, confidence, vehicle_type in detections:
             x1, y1, x2, y2 = map(int, box)
             center_x = (x1 + x2) // 2
@@ -445,45 +452,143 @@ class VehicleCounter:
             self.counted_ids.discard(track_id)
         self.last_track_cleanup_time = current_time
 
-    def _update_fps(self, current_time: float) -> None:
-        frame_duration = current_time - self.previous_frame_time
+    def _update_fps(self, frame_duration: float) -> None:
         if frame_duration > 0:
             instantaneous_fps = 1.0 / frame_duration
             self.fps = instantaneous_fps if self.fps == 0 else 0.9 * self.fps + 0.1 * instantaneous_fps
-        self.previous_frame_time = current_time
+
+    def _update_render_fps(self) -> None:
+        current_time = time.perf_counter()
+        self.rendered_frame_times.append(current_time)
+        while self.rendered_frame_times and self.rendered_frame_times[0] <= current_time - 1:
+            self.rendered_frame_times.popleft()
+        self.render_fps = float(len(self.rendered_frame_times))
 
     def _show_frame(self, frame: np.ndarray) -> None:
-        display_height = max(frame.shape[0], 460)
+        display_height = max(frame.shape[0], 530)
         video_area = np.zeros((display_height, frame.shape[1], 3), dtype=np.uint8)
         video_area[: frame.shape[0], :] = frame
-        panel = _status_panel(display_height, self.vehicle_counts, self.fps)
+        panel = _status_panel(
+            display_height,
+            self.vehicle_counts,
+            self.fps,
+            self.render_fps,
+            self.cloud_delay_ms,
+            self.yolo_ms,
+            self.local_ms,
+        )
         cv2.imshow("Car Counter", np.hstack((video_area, panel)))
 
-    def run(self) -> None:
+    def _queue_display_frame(self, frame: np.ndarray) -> None:
+        while not self.stop_event.is_set():
+            try:
+                self.display_queue.put(frame, timeout=0.1)
+                return
+            except Full:
+                pass
+
+    def _capture_loop(self) -> None:
         try:
-            while True:
+            while not self.stop_event.is_set():
                 success, frame = self.camera.read()
                 if not success:
-                    break
-
-                current_time = time.perf_counter()
+                    return
                 frame = frame[
                     self.crop_y : self.crop_y + self.crop_height,
                     self.crop_x : self.crop_x + self.crop_width,
                 ]
                 if frame.size == 0:
                     raise RuntimeError("Crop is empty; restart and select a valid crop")
+                captured_frame = (frame, time.perf_counter())
+                try:
+                    self.capture_queue.put(captured_frame, timeout=0.01)
+                except Full:
+                    # Keep the newest camera frames when inference falls behind.
+                    try:
+                        self.capture_queue.get_nowait()
+                    except Empty:
+                        pass
+                    self.capture_queue.put_nowait(captured_frame)
+        except Exception as error:
+            self.cloud_error = str(error)
+            print(f"Camera capture stopped: {error}")
+        finally:
+            self.capture_finished.set()
 
-                detections = self._read_detections(frame)
-                self._process_detections(frame, detections, current_time)
-                self._cleanup_expired_tracks(current_time)
-                self._update_fps(current_time)
+    def _inference_loop(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                batch: list[tuple[np.ndarray, float]] = []
+                while len(batch) < CLOUD_BATCH_SIZE and not self.stop_event.is_set():
+                    try:
+                        batch.append(self.capture_queue.get(timeout=0.1))
+                    except Empty:
+                        if self.capture_finished.is_set():
+                            break
+                if not batch:
+                    if self.capture_finished.is_set():
+                        break
+                    continue
+
+                loop_started_at = time.perf_counter()
+                try:
+                    detection_batches = self._read_detection_batches([frame for frame, _ in batch])
+                except requests.RequestException:
+                    self.cloud_error = "Cloud unavailable - reconnecting..."
+                    self._queue_display_frame(batch[-1][0])
+                    time.sleep(0.25)
+                    continue
+                self.cloud_error = None
+                for (frame, current_time), detections in zip(batch, detection_batches):
+                    self._process_detections(frame, detections, current_time)
+                    self._cleanup_expired_tracks(current_time)
+                frame_duration = (time.perf_counter() - loop_started_at) / len(batch)
+                self.local_ms = max(0.0, frame_duration * 1000 - self.cloud_delay_ms / len(batch))
+                self._update_fps(frame_duration)
+                for frame, _ in batch:
+                    self._queue_display_frame(frame)
+        except Exception as error:
+            self.cloud_error = str(error)
+            print(f"Cloud inference stopped: {error}")
+        finally:
+            self.inference_finished.set()
+
+    def run(self) -> None:
+        capture_worker = Thread(target=self._capture_loop, daemon=True)
+        worker = Thread(target=self._inference_loop, daemon=True)
+        capture_worker.start()
+        worker.start()
+        next_display_at = time.perf_counter()
+        display_started = False
+        try:
+            while not (self.inference_finished.is_set() and self.display_queue.empty()):
+                if not display_started and self.display_queue.qsize() < DISPLAY_BUFFER_FRAMES:
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                    continue
+                display_started = True
+                try:
+                    frame = self.display_queue.get(timeout=0.05)
+                except Empty:
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                    continue
+                if self.cloud_error:
+                    cv2.putText(frame, self.cloud_error, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                self._update_render_fps()
                 self._show_frame(frame)
-
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                next_display_at += 1 / DISPLAY_FPS
+                remaining_ms = max(1, round((next_display_at - time.perf_counter()) * 1000))
+                if remaining_ms == 1:
+                    next_display_at = time.perf_counter()
+                if cv2.waitKey(remaining_ms) & 0xFF == ord("q"):
                     break
         finally:
+            self.stop_event.set()
+            capture_worker.join(timeout=2)
+            worker.join(timeout=16)
             self.camera.release()
+            self.cloud_session.close()
             cv2.destroyAllWindows()
             self.csv_file.close()
             self.supabase_uploader.close()
@@ -493,6 +598,10 @@ def _status_panel(
     frame_height: int,
     vehicle_counts: dict[tuple[VehicleType, Direction], int],
     fps: float,
+    render_fps: float,
+    cloud_delay_ms: float,
+    yolo_ms: float,
+    local_ms: float,
 ) -> np.ndarray:
     """Create a sidebar that is separate from the camera image."""
     panel = np.full((frame_height, 430, 3), (28, 28, 28), dtype=np.uint8)
@@ -534,7 +643,11 @@ def _status_panel(
         )
         cv2.line(panel, (15, y + 18), (415, y + 18), (55, 55, 55), 1)
 
-    cv2.putText(panel, f"FPS  {fps:.1f}", (20, 430), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
+    cv2.putText(panel, f"Cloud  {cloud_delay_ms:.0f} ms / {CLOUD_BATCH_SIZE}", (20, 365), cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_color, 2)
+    cv2.putText(panel, f"YOLO   {yolo_ms:.0f} ms / {CLOUD_BATCH_SIZE}", (20, 395), cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_color, 2)
+    cv2.putText(panel, f"Local  {local_ms:.0f} ms", (20, 425), cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_color, 2)
+    cv2.putText(panel, f"Process  {fps:.1f} FPS", (20, 465), cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_color, 2)
+    cv2.putText(panel, f"Render   {render_fps:.1f} FPS", (20, 500), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
     return panel
 
 

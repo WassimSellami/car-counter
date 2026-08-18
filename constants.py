@@ -1,9 +1,20 @@
 START_IMMEDIATELY = True
 START_HOURS = 5
 START_MINUTES = 15
-CAMERA_INDEX = 0  # Set this to the DroidCam index printed by find_camera.py.
-# Requested DroidCam capture resolution. DroidCam must also be configured to
-# offer this resolution; otherwise its driver will use the nearest supported one.
+# Set True only when you want new count rows uploaded to Supabase.
+# CSV files are always saved locally.
+UPLOAD_TO_SUPABASE = False
+# Frames sent together for cloud inference. Higher values trade more delay for throughput.
+CLOUD_BATCH_SIZE = 10
+# DroidCam virtual webcam index on Windows.
+CAMERA_SOURCE = 0
+# DroidCam delivers a stable 30 FPS to Windows. Render cloud result batches at
+# this cadence instead of showing each returned batch in a burst.
+DISPLAY_FPS = 30
+# Keep two cloud batches ready before playback so cloud/network jitter does not
+# make the local 30-FPS display stutter.
+DISPLAY_BUFFER_FRAMES = CLOUD_BATCH_SIZE * 2
+# Requested mode for the DroidCam virtual webcam.
 CAMERA_WIDTH = 1920
 CAMERA_HEIGHT = 1080
 # Default width for traffic-flow chart buckets.

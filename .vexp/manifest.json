@@ -1,0 +1,25 @@
+{
+  "file_hashes": {
+    "README.md": "eb578c1bf92ebe59c9f3611081cad70a006cdbe84f4853ab8a147c1807229e74",
+    "camera_utils.py": "71c2967fae560e988de71f731700380a8b0ca273016849b90aeaefb86252c765",
+    "constants.py": "04c523c0aad4c0f41b7d7129714231ea762e735d21f8e9abcbc53c542881db79",
+    "counter.py": "789bf15efc43fcea50807b2204195ddc99c74fbe81721cac20af72405a0d3db5",
+    "enums.py": "5279f0a6c74053237f9721c8dd2b00f100095799d77d5039812db7de5c36c50c",
+    "find_camera.py": "c0619d136db049958e3dd0db0948a3033e38cde96a29664cffe91f5552a565fc",
+    "live_traffic_dashboard.py": "64ce4f4c4e9d9b5f5e8d593bb8900a06f7656606f423db0ff22b3c17c06861f0",
+    "migrate_global_record_ids.py": "c50652d9bf08e65c97ee6bc0c5e5529237a6ced8248a36055cdbf093c090953a",
+    "migrate_supabase_record_ids.sql": "c766c2b23f7836d4a7b972ed313c9c1b103ff97e5598711a01f33fd9d79061ca",
+    "sync_counts_to_supabase.py": "a40cac597ba042c7b573e092d323cc372cdfe52a8fcb9fb7e237938fa0553fd6",
+    "vehicle_counter_analysis.py": "a0095bbd4fccf864ff3ec7005ed238f85506346f62e9abdb8d250561cdb8db94",
+    "view_camera.py": "99d5d0b6857ad8613e78eaacb044b31acd16bf0dca817618e7f1122d08128af1"
+  },
+  "indexed_at_commit": "e49a38bd355d5dfc81990927ff959870ce290357",
+  "indexed_at_timestamp": "2026-08-17T16:43:12.335538200+00:00",
+  "schema_version": 3,
+  "stats": {
+    "total_edges": 80,
+    "total_files": 12,
+    "total_nodes": 75
+  },
+  "vexp_version": "2.6.2"
+}

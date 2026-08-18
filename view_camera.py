@@ -4,17 +4,14 @@ import cv2
 import time
 
 from camera_utils import open_camera
-
-CAMERA_INDEX = 0  # Set this to the DroidCam index printed by find_camera.py.
-CAMERA_WIDTH = 1920
-CAMERA_HEIGHT = 1080
+from constants import CAMERA_HEIGHT, CAMERA_SOURCE, CAMERA_WIDTH
 MEASUREMENT_SECONDS = 5
 
 
 def main() -> None:
-    camera = open_camera(CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT)
+    camera = open_camera(CAMERA_SOURCE, CAMERA_WIDTH, CAMERA_HEIGHT)
     if not camera.isOpened():
-        raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
+        raise RuntimeError(f"Could not open camera source {CAMERA_SOURCE}")
 
     try:
         print(f"Measuring the feed for {MEASUREMENT_SECONDS} seconds...")
