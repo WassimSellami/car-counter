@@ -17,6 +17,22 @@ class VehicleType(IntEnum):
     BICYCLE = 3
 
 
+class VehicleColor(IntEnum):
+    """Colour codes stored with counted vehicles."""
+
+    UNKNOWN = 0
+    BLACK = 1
+    WHITE = 2
+    GREY = 3
+    SILVER = 4
+    RED = 5
+    BLUE = 6
+    GREEN = 7
+    YELLOW = 8
+    ORANGE = 9
+    BROWN = 10
+
+
 class TimeOfDay(IntEnum):
     """Lighting modes written to the CSV."""
 

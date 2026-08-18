@@ -1,6 +1,6 @@
 """Count detected cars once based on their horizontal travel direction."""
 
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 import csv
 import ctypes
 from datetime import date, datetime, timedelta
@@ -46,11 +46,10 @@ from constants import (
     START_MINUTES,
     TRACK_MEMORY_SECONDS,
     TRUCK_CLASS_ID,
-    UPLOAD_TO_SUPABASE,
 )
 from camera_utils import open_camera
 from cloud_detection_client import INFERENCE_WIDTH, JPEG_QUALITY, infer_frame_batch
-from enums import Direction, TimeOfDay, VehicleType
+from enums import Direction, TimeOfDay, VehicleColor, VehicleType
 
 logging.getLogger("ultralytics").disabled = True
 
@@ -69,7 +68,7 @@ def _direction_distance_ratio(vehicle_type: VehicleType) -> float:
     return MIN_DIRECTION_DISTANCE_RATIO
 
 
-CSV_FIELDNAMES = ["id", "timestamp", "direction", "vehicle_type", "time_of_day", "confidence"]
+CSV_FIELDNAMES = ["id", "timestamp", "direction", "vehicle_type", "color", "time_of_day", "confidence"]
 
 
 def _empty_vehicle_counts() -> dict[tuple[VehicleType, Direction], int]:
@@ -78,6 +77,10 @@ def _empty_vehicle_counts() -> dict[tuple[VehicleType, Direction], int]:
         for vehicle_type in VehicleType
         for direction in Direction
     }
+
+
+def _empty_color_counts() -> dict[VehicleColor, int]:
+    return {color: 0 for color in VehicleColor if color is not VehicleColor.UNKNOWN}
 
 
 def _load_dotenv() -> None:
@@ -100,10 +103,10 @@ class SupabaseCountUploader:
         self.url = os.environ.get("SUPABASE_URL", "").rstrip("/")
         self.service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
         self.queue: Queue[dict | None] = Queue()
-        self.worker: Thread | None = None
-        if UPLOAD_TO_SUPABASE and self.url and self.service_key:
-            self.worker = Thread(target=self._upload_loop, daemon=True)
-            self.worker.start()
+        if not self.url or not self.service_key:
+            raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env")
+        self.worker: Thread | None = Thread(target=self._upload_loop, daemon=True)
+        self.worker.start()
 
     def submit(self, row: dict) -> None:
         if self.worker is not None:
@@ -141,9 +144,10 @@ class SupabaseCountUploader:
                     time.sleep(5)
 
 
-def _load_daily_counts(output_directory: Path) -> dict[tuple[VehicleType, Direction], int]:
+def _load_daily_counts(output_directory: Path) -> tuple[dict[tuple[VehicleType, Direction], int], dict[VehicleColor, int]]:
     """Restore totals from the daily CSV, falling back to legacy files if needed."""
     counts = _empty_vehicle_counts()
+    color_counts = _empty_color_counts()
     daily_files = list(output_directory.glob("count_*.csv"))
     # A count file may have been created by copying a legacy run file. Do
     # not add both, because they represent the same earlier detections.
@@ -159,9 +163,15 @@ def _load_daily_counts(output_directory: Path) -> dict[tuple[VehicleType, Direct
                         except (KeyError, TypeError, ValueError):
                             continue
                         counts[(vehicle_type, direction)] += 1
+                        try:
+                            color = VehicleColor(int(row.get("color", 0)))
+                        except (TypeError, ValueError):
+                            color = VehicleColor.UNKNOWN
+                        if vehicle_type is VehicleType.CAR and color is not VehicleColor.UNKNOWN:
+                            color_counts[color] += 1
             except OSError:
                 continue
-    return counts
+    return counts, color_counts
 
 
 def _next_record_id() -> int:
@@ -180,20 +190,28 @@ def _next_record_id() -> int:
     return highest_id + 1
 
 
-def _open_csv_writer(day: date) -> tuple[Path, TextIO, csv.DictWriter, dict[tuple[VehicleType, Direction], int], int]:
+def _open_csv_writer(day: date) -> tuple[Path, TextIO, csv.DictWriter, dict[tuple[VehicleType, Direction], int], dict[VehicleColor, int], int]:
     """Append to the day's CSV and restore its accumulated totals."""
     output_directory = Path("outputs") / day.isoformat()
     output_directory.mkdir(parents=True, exist_ok=True)
     csv_path = output_directory / f"count_{day.strftime('%Y%m%d')}.csv"
     has_rows = csv_path.is_file() and csv_path.stat().st_size > 0
-    counts = _load_daily_counts(output_directory)
+    if has_rows:
+        with csv_path.open("r", newline="", encoding="utf-8") as existing_file:
+            existing_header = next(csv.reader(existing_file), [])
+        if existing_header != CSV_FIELDNAMES:
+            # Preserve old count data rather than mixing rows with incompatible
+            # headers. The daily total loader reads both files.
+            csv_path = output_directory / f"count_{day.strftime('%Y%m%d')}_color_ids.csv"
+            has_rows = csv_path.is_file() and csv_path.stat().st_size > 0
+    counts, color_counts = _load_daily_counts(output_directory)
     next_record_id = _next_record_id()
     csv_file = csv_path.open("a", newline="", encoding="utf-8", buffering=1)
     csv_writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDNAMES)
     if not has_rows:
         csv_writer.writeheader()
         csv_file.flush()
-    return csv_path, csv_file, csv_writer, counts, next_record_id
+    return csv_path, csv_file, csv_writer, counts, color_counts, next_record_id
 
 
 def _select_startup_road() -> tuple[np.ndarray, tuple[int, int]]:
@@ -272,6 +290,7 @@ class VehicleCounter:
             self.csv_file,
             self.csv_writer,
             self.vehicle_counts,
+            self.color_counts,
             self.next_record_id,
         ) = _open_csv_writer(self.csv_day)
         self.supabase_uploader = SupabaseCountUploader()
@@ -293,6 +312,7 @@ class VehicleCounter:
         self.road_projection = cv2.getPerspectiveTransform(road_points, destination_points)
         self.display_width, self.display_height = _screen_size()
         self.track_history: dict[int, list[int]] = defaultdict(list)
+        self.track_color_counts: dict[int, Counter[VehicleColor]] = defaultdict(Counter)
         self.counted_ids: set[int] = set()
         self.minimum_distances = {
             vehicle_type: max(25, int(self.road_width * _direction_distance_ratio(vehicle_type)))
@@ -312,6 +332,7 @@ class VehicleCounter:
         self.rendered_frame_times: deque[float] = deque()
         self.cloud_delay_ms = 0.0
         self.yolo_ms = 0.0
+        self.clip_ms = 0.0
         self.local_ms = 0.0
         self.capture_queue: Queue[tuple[np.ndarray, float]] = Queue(maxsize=CLOUD_BATCH_SIZE * 3)
         self.display_queue: Queue[np.ndarray] = Queue(maxsize=CLOUD_BATCH_SIZE * 3)
@@ -319,6 +340,7 @@ class VehicleCounter:
         self.capture_finished = Event()
         self.inference_finished = Event()
         self.cloud_error: str | None = None
+        self.mouse_position: tuple[int, int] | None = None
         self.last_track_cleanup_time = time.perf_counter()
 
         if NIGHT_MODE:
@@ -326,7 +348,7 @@ class VehicleCounter:
 
     def _read_detection_batches(
         self, frames: list[np.ndarray]
-    ) -> list[list[tuple[tuple[float, float, float, float], int | None, float, VehicleType]]]:
+    ) -> list[list[tuple[tuple[float, float, float, float], int | None, float, VehicleType, VehicleColor]]]:
         if NIGHT_MODE:
             assert self.light_tracker is not None
             return [
@@ -336,13 +358,14 @@ class VehicleCounter:
                         track_id,
                         1.0,
                         VehicleType.CAR,
+                        VehicleColor.UNKNOWN,
                     )
                     for box, track_id in self.light_tracker.update(frame)
                 ]
                 for frame in frames
             ]
 
-        detection_batches, dimensions, cloud_delay, yolo_ms = infer_frame_batch(
+        detection_batches, dimensions, cloud_delay, yolo_ms, clip_ms = infer_frame_batch(
             self.cloud_session,
             frames,
             self.cloud_batch_url,
@@ -352,6 +375,7 @@ class VehicleCounter:
         )
         self.cloud_delay_ms = cloud_delay * 1000
         self.yolo_ms = yolo_ms
+        self.clip_ms = clip_ms
         if detection_batches and detection_batches[0] and "track_id" not in detection_batches[0][0]:
             raise RuntimeError(
                 "Cloud server is outdated. Upload and restart vast_inference_server.py."
@@ -368,6 +392,7 @@ class VehicleCounter:
                     detection["track_id"],
                     detection["confidence"],
                     self.class_to_vehicle_type[detection["class_id"]],
+                    VehicleColor.__members__.get(detection.get("color", "").upper(), VehicleColor.UNKNOWN),
                 )
                 for detection in detections
             ]
@@ -380,15 +405,19 @@ class VehicleCounter:
         confidence: float,
         vehicle_type: VehicleType,
         count_direction: Direction,
+        vehicle_color: VehicleColor,
     ) -> None:
         self._rotate_csv_at_midnight()
         self.counted_ids.add(track_id)
         self.vehicle_counts[(vehicle_type, count_direction)] += 1
+        if vehicle_type is VehicleType.CAR and vehicle_color is not VehicleColor.UNKNOWN:
+            self.color_counts[vehicle_color] += 1
         row = {
             "id": self.next_record_id,
             "timestamp": datetime.now().isoformat(timespec="milliseconds"),
             "direction": int(count_direction),
             "vehicle_type": int(vehicle_type),
+            "color": int(vehicle_color),
             "confidence": f"{confidence:.4f}",
             **self.base_row,
         }
@@ -402,6 +431,7 @@ class VehicleCounter:
                 "direction": row["direction"],
                 "vehicle_type": row["vehicle_type"],
                 "time_of_day": row["time_of_day"],
+                "color": int(row["color"]),
                 "confidence": float(row["confidence"]),
             }
         )
@@ -419,27 +449,35 @@ class VehicleCounter:
             self.csv_file,
             self.csv_writer,
             self.vehicle_counts,
+            self.color_counts,
             self.next_record_id,
         ) = _open_csv_writer(current_day)
         self.csv_day = current_day
         self.counted_ids.clear()
         self.track_history.clear()
+        self.track_color_counts.clear()
         self.track_last_seen.clear()
 
     def _process_detections(
         self,
         frame: np.ndarray,
-        detections: list[tuple[tuple[float, float, float, float], int | None, float, VehicleType]],
+        detections: list[tuple[tuple[float, float, float, float], int | None, float, VehicleType, VehicleColor]],
         current_time: float,
     ) -> None:
         if not detections:
             return
-        for box, track_id, confidence, vehicle_type in detections:
+        for box, track_id, confidence, vehicle_type, vehicle_color in detections:
             x1, y1, x2, y2 = map(int, box)
             center_x = (x1 + x2) // 2
             accepted = confidence >= _confidence_threshold(vehicle_type)
+            chosen_color = vehicle_color
             if track_id is not None and accepted:
                 self.track_last_seen[track_id] = current_time
+                if vehicle_type is VehicleType.CAR:
+                    if vehicle_color is not VehicleColor.UNKNOWN:
+                        self.track_color_counts[track_id][vehicle_color] += 1
+                    if self.track_color_counts[track_id]:
+                        chosen_color = self.track_color_counts[track_id].most_common(1)[0][0]
                 history = self.track_history[track_id]
                 history.append(center_x)
                 if len(history) > 30:
@@ -456,11 +494,22 @@ class VehicleCounter:
                     count_direction = None
                 if count_direction is not None and track_id not in self.counted_ids:
                     self._record_count(
-                        track_id, confidence, vehicle_type, count_direction
+                        track_id, confidence, vehicle_type, count_direction, chosen_color
                     )
 
             color = (0, 255, 0) if accepted else (0, 165, 255)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            if vehicle_type is VehicleType.CAR and chosen_color is not VehicleColor.UNKNOWN:
+                cv2.putText(
+                    frame,
+                    chosen_color.name.lower(),
+                    (x1, max(18, y1 - 7)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
 
     def _cleanup_expired_tracks(self, current_time: float) -> None:
         if current_time - self.last_track_cleanup_time < 10.0:
@@ -474,6 +523,7 @@ class VehicleCounter:
         for track_id in expired_track_ids:
             self.track_last_seen.pop(track_id, None)
             self.track_history.pop(track_id, None)
+            self.track_color_counts.pop(track_id, None)
             self.counted_ids.discard(track_id)
         self.last_track_cleanup_time = current_time
 
@@ -495,13 +545,20 @@ class VehicleCounter:
             self.display_width,
             self.display_height,
             self.vehicle_counts,
+            self.color_counts,
             self.fps,
             self.render_fps,
             self.cloud_delay_ms,
             self.yolo_ms,
+            self.clip_ms,
             self.local_ms,
+            self.mouse_position,
         )
         cv2.imshow("Car Counter", dashboard)
+
+    def _on_mouse(self, event: int, x: int, y: int, _flags: int, _params: object) -> None:
+        if event == cv2.EVENT_MOUSEMOVE:
+            self.mouse_position = (x, y)
 
     def _queue_display_frame(self, frame: np.ndarray) -> None:
         while not self.stop_event.is_set():
@@ -581,6 +638,7 @@ class VehicleCounter:
         worker.start()
         cv2.namedWindow("Car Counter", cv2.WINDOW_NORMAL)
         cv2.setWindowProperty("Car Counter", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        cv2.setMouseCallback("Car Counter", self._on_mouse)
         next_display_at = time.perf_counter()
         display_started = False
         try:
@@ -622,11 +680,14 @@ def _dashboard(
     width: int,
     height: int,
     vehicle_counts: dict[tuple[VehicleType, Direction], int],
+    color_counts: dict[VehicleColor, int],
     fps: float,
     render_fps: float,
     cloud_delay_ms: float,
     yolo_ms: float,
+    clip_ms: float,
     local_ms: float,
+    mouse_position: tuple[int, int] | None,
 ) -> np.ndarray:
     """Build the fullscreen monitoring dashboard around the camera image."""
     background = (20, 23, 28)
@@ -650,34 +711,49 @@ def _dashboard(
     into_color = (70, 235, 70)
     out_color = (0, 190, 255)
     card_color = (33, 38, 46)
-    cv2.putText(surface, "CLOUD VEHICLE COUNTER", (margin, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.82, white, 2)
-    cv2.putText(surface, "LIVE ROAD ANALYTICS", (margin, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.48, muted, 1)
-
+    pie_colors = {
+        VehicleColor.BLACK: (34, 34, 34),
+        VehicleColor.WHITE: (235, 235, 235),
+        VehicleColor.GREY: (128, 128, 128),
+        VehicleColor.SILVER: (192, 192, 192),
+        VehicleColor.RED: (60, 60, 235),
+        VehicleColor.BLUE: (235, 130, 45),
+        VehicleColor.GREEN: (65, 185, 65),
+        VehicleColor.YELLOW: (40, 220, 245),
+        VehicleColor.ORANGE: (0, 145, 255),
+        VehicleColor.BROWN: (42, 75, 135),
+    }
     metrics = [
-        ("CLOUD", f"{cloud_delay_ms:.0f} ms / {CLOUD_BATCH_SIZE}"),
-        ("YOLO", f"{yolo_ms:.0f} ms / {CLOUD_BATCH_SIZE}"),
-        ("PROCESS", f"{fps:.1f} FPS"),
-        ("RENDER", f"{render_fps:.1f} FPS"),
+        ("CLOUD", f"{cloud_delay_ms:.0f} ms / {CLOUD_BATCH_SIZE}", (255, 205, 70)),
+        ("YOLO", f"{yolo_ms:.0f} ms / {CLOUD_BATCH_SIZE}", (80, 235, 90)),
+        ("CLIP", f"{clip_ms:.0f} ms / {CLOUD_BATCH_SIZE}", (235, 100, 230)),
+        ("OTHER CLOUD", f"{max(0, cloud_delay_ms - yolo_ms - clip_ms):.0f} ms", (80, 190, 255)),
+        ("PROCESS", f"{fps:.1f} FPS", (0, 210, 255)),
+        ("RENDER", f"{render_fps:.1f} FPS", (0, 165, 255)),
     ]
-    card_width = 185
+    card_width = 164
     card_height = 68
-    for index, (label, value) in enumerate(metrics):
-        x = width - margin - (len(metrics) - index) * (card_width + 10) + 10
+    metric_gap = 10
+    metrics_width = len(metrics) * card_width + (len(metrics) - 1) * metric_gap
+    for index, (label, value, value_color) in enumerate(metrics):
+        x = (width - metrics_width) // 2 + index * (card_width + metric_gap)
         cv2.rectangle(surface, (x, 20), (x + card_width, 20 + card_height), card_color, -1)
-        cv2.putText(surface, label, (x + 14, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.43, muted, 1)
-        cv2.putText(surface, value, (x + 14, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.56, white, 2)
+        cv2.putText(surface, label, (x + 12, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.39, muted, 1)
+        cv2.putText(surface, value, (x + 12, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.54, value_color, 2)
 
     footer_y = video_y + video_height + 18
-    cv2.putText(surface, "OBJECT COUNTS", (margin, footer_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, white, 2)
     rows = [
         ("Car / van", VehicleType.CAR),
         ("Truck", VehicleType.TRUCK),
         ("Bus", VehicleType.BUS),
         ("Bicycle", VehicleType.BICYCLE),
     ]
-    table_x = margin
-    table_y = footer_y + 42
-    table_width = width - 2 * margin
+    table_y = footer_y + 10
+    color_panel_width = 300
+    panel_gap = 28
+    table_width = min(1100, width - 3 * margin - color_panel_width)
+    dashboard_group_width = table_width + panel_gap + color_panel_width
+    table_x = (width - dashboard_group_width) // 2
     header_row_height = 42
     row_height = 45
     type_width = int(table_width * 0.46)
@@ -700,7 +776,38 @@ def _dashboard(
         cv2.putText(surface, str(vehicle_counts[(vehicle_type, out_direction)]), (table_x + type_width + direction_width + 18, baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.95, out_color, 2)
         cv2.line(surface, (table_x, y + row_height), (table_x + table_width, y + row_height), (54, 61, 70), 1)
 
-    cv2.putText(surface, f"Local overhead {local_ms:.0f} ms", (width - 225, footer_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.42, muted, 1)
+    panel_x = table_x + table_width + panel_gap
+    panel_y = table_y
+    cv2.rectangle(surface, (panel_x, panel_y), (panel_x + color_panel_width, panel_y + table_height), card_color, -1)
+    cv2.putText(surface, "CAR COLOURS", (panel_x + 18, panel_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, white, 2)
+    centre = (panel_x + color_panel_width // 2, panel_y + table_height // 2 + 18)
+    radius = min(78, table_height // 2 - 35)
+    total_colors = sum(color_counts.values())
+    hovered_color: VehicleColor | None = None
+    if total_colors:
+        start_angle = -90.0
+        for vehicle_color, count in color_counts.items():
+            if not count:
+                continue
+            end_angle = start_angle + 360 * count / total_colors
+            cv2.ellipse(surface, centre, (radius, radius), 0, start_angle, end_angle, pie_colors[vehicle_color], -1, cv2.LINE_AA)
+            if mouse_position is not None:
+                dx, dy = mouse_position[0] - centre[0], mouse_position[1] - centre[1]
+                distance = (dx * dx + dy * dy) ** 0.5
+                angle = (np.degrees(np.arctan2(dy, dx)) + 90) % 360
+                if radius // 2 < distance <= radius and (start_angle + 90) <= angle < (end_angle + 90):
+                    hovered_color = vehicle_color
+            start_angle = end_angle
+        cv2.circle(surface, centre, radius // 2, card_color, -1, cv2.LINE_AA)
+    else:
+        cv2.circle(surface, centre, radius, (70, 78, 88), -1, cv2.LINE_AA)
+
+    if hovered_color is not None:
+        percentage = 100 * color_counts[hovered_color] / total_colors
+        tooltip = f"{hovered_color.name.title()}  {percentage:.1f}%"
+        cv2.rectangle(surface, (panel_x + 10, panel_y + 39), (panel_x + color_panel_width - 10, panel_y + 69), (44, 51, 60), -1)
+        cv2.putText(surface, tooltip, (panel_x + 20, panel_y + 61), cv2.FONT_HERSHEY_SIMPLEX, 0.52, white, 1, cv2.LINE_AA)
+
     return surface
 
 

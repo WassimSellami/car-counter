@@ -96,7 +96,7 @@ def infer_frame(
     headers: dict[str, str],
     maximum_width: int,
     jpeg_quality: int,
-) -> tuple[list[dict], int, int, float, float]:
+) -> tuple[list[dict], int, int, float, float, float]:
     """Send one frame and return its boxes plus the cloud round-trip time."""
     frame_height, frame_width = frame.shape[:2]
     inference_width = min(maximum_width, frame_width)
@@ -124,6 +124,7 @@ def infer_frame(
         inference_height,
         time.perf_counter() - started_at,
         float(response.headers.get("X-Yolo-Ms", 0)),
+        float(response.headers.get("X-Clip-Ms", 0)),
     )
 
 
@@ -134,7 +135,7 @@ def infer_frame_batch(
     headers: dict[str, str],
     maximum_width: int,
     jpeg_quality: int,
-) -> tuple[list[list[dict]], list[tuple[int, int]], float, float]:
+) -> tuple[list[list[dict]], list[tuple[int, int]], float, float, float]:
     """Send up to three ordered frames for one batched cloud inference."""
     files = []
     dimensions = []
@@ -164,6 +165,7 @@ def infer_frame_batch(
         dimensions,
         time.perf_counter() - started_at,
         float(response.headers.get("X-Yolo-Ms", 0)),
+        float(response.headers.get("X-Clip-Ms", 0)),
     )
 
 
@@ -194,7 +196,7 @@ def main() -> None:
 
             frame_height, frame_width = frame.shape[:2]
             try:
-                detections, detection_width, detection_height, elapsed, yolo_ms = infer_frame(
+                detections, detection_width, detection_height, elapsed, yolo_ms, clip_ms = infer_frame(
                     session,
                     frame,
                     url,
@@ -231,7 +233,7 @@ def main() -> None:
             cv2.putText(
                 frame,
                 f"Cloud {1 / elapsed:.1f} FPS | Delay {elapsed * 1000:.0f} ms | "
-                f"YOLO {yolo_ms:.0f} ms",
+                f"YOLO {yolo_ms:.0f} ms | CLIP {clip_ms:.0f} ms",
                 (12, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,

@@ -69,6 +69,7 @@ def rows_from_csv(csv_path: Path) -> list[dict]:
                         "timestamp": row["timestamp"],
                         "direction": int(row["direction"]),
                         "vehicle_type": int(row["vehicle_type"]),
+                        "color": int(row.get("color", 0)),
                         "time_of_day": int(row["time_of_day"]),
                         "confidence": float(row["confidence"]),
                     }

@@ -63,7 +63,10 @@ def discover_count_csv_files() -> list[Path]:
 def load_counts(csv_files: list[Path]) -> pd.DataFrame:
     frames = []
     for csv_file in csv_files:
-        frame = pd.read_csv(csv_file, usecols=["timestamp", "direction", "vehicle_type"])
+        frame = pd.read_csv(
+            csv_file,
+            usecols=lambda column: column in {"timestamp", "direction", "vehicle_type", "color"},
+        )
         frames.append(frame)
 
     if not frames:

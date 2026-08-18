@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 
 import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
@@ -29,6 +30,14 @@ TRACE_NAMES = [
     if vehicle_type != "Bicycle"
     for direction in ("Into Passau", "Out of Passau")
 ]
+CAR_COLOR_LABELS = {
+    1: "Black", 2: "White", 3: "Grey", 4: "Silver", 5: "Red",
+    6: "Blue", 7: "Green", 8: "Yellow", 9: "Orange", 10: "Brown",
+}
+CAR_COLOR_HEX = {
+    1: "#242424", 2: "#f3f3f3", 3: "#808080", 4: "#c0c0c0", 5: "#e53935",
+    6: "#2d82d7", 7: "#41a85f", 8: "#f5dc28", 9: "#ff8c00", 10: "#874b2a",
+}
 
 
 def csv_files():
@@ -74,7 +83,7 @@ def fetch_supabase_rows(
         response = requests.get(
             f"{url.rstrip('/')}/rest/v1/traffic_counts",
             params=[
-                ("select", "record_id,timestamp,direction,vehicle_type"),
+                ("select", "record_id,timestamp,direction,vehicle_type,color"),
                 ("timestamp", timestamp_filter),
                 ("timestamp", f"lt.{next_day.isoformat()}T00:00:00"),
                 ("order", "timestamp.asc,record_id.asc"),
@@ -171,6 +180,35 @@ def render_object_counts(data: pd.DataFrame, timeframe: tuple[datetime, datetime
         )
 
 
+def render_color_pie(data: pd.DataFrame, timeframe: tuple[datetime, datetime]) -> None:
+    """Show the distribution of classified car colours for the selected period."""
+    timeframe_data, timeframe_label = data_for_count_timeframe(data, timeframe)
+    if "color" not in timeframe_data:
+        st.caption("Car colour data is not available for this period yet.")
+        return
+    colors = pd.to_numeric(timeframe_data["color"], errors="coerce")
+    colors = colors[timeframe_data["vehicle_type"].eq("Car / van") & colors.isin(CAR_COLOR_LABELS)]
+    counts = colors.value_counts().sort_index()
+    st.subheader("Car colours")
+    st.caption(f"Classified cars for {timeframe_label}.")
+    if counts.empty:
+        st.caption("No classified cars in this timeframe yet.")
+        return
+    figure = go.Figure(
+        go.Pie(
+            labels=[CAR_COLOR_LABELS[int(color)] for color in counts.index],
+            values=counts.values,
+            marker={"colors": [CAR_COLOR_HEX[int(color)] for color in counts.index]},
+            hole=0.5,
+            textinfo="none",
+            hovertemplate="%{label}: %{percent}<extra></extra>",
+            sort=False,
+        )
+    )
+    figure.update_layout(showlegend=False, margin={"l": 0, "r": 0, "t": 0, "b": 0}, height=270)
+    st.plotly_chart(figure, use_container_width=True, config={"responsive": True})
+
+
 st.set_page_config(page_title="Live traffic flow", layout="wide")
 st.title("Live traffic flow")
 st.caption(f"The selected day refreshes every {REFRESH_INTERVAL_LABEL} while this page is open.")
@@ -251,7 +289,7 @@ def render_live_chart() -> None:
     )
 
     st.divider()
-    count_panel, _ = st.columns([1, 2])
+    count_panel, color_panel = st.columns([2, 1])
     with count_panel:
         available_start = day_data["timestamp"].min().to_pydatetime()
         available_end = day_data["timestamp"].max().to_pydatetime()
@@ -281,6 +319,8 @@ def render_live_chart() -> None:
                 key=slider_key,
             )
         render_object_counts(day_data, count_timeframe)
+    with color_panel:
+        render_color_pie(day_data, count_timeframe)
 
 
 render_live_chart()
