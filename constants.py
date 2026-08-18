@@ -11,6 +11,8 @@ CAMERA_SOURCE = 0
 # DroidCam delivers a stable 30 FPS to Windows. Render cloud result batches at
 # this cadence instead of showing each returned batch in a burst.
 DISPLAY_FPS = 30
+# Local Streamlit dashboard snapshot rate. This does not affect camera rendering.
+LIVE_DASHBOARD_PUBLISH_INTERVAL_SECONDS = 1 / 3
 # Set False if vehicles entering Passau move left in this camera view.
 INTO_PASSAU_IS_RIGHT = True
 # Keep two cloud batches ready before playback so cloud/network jitter does not

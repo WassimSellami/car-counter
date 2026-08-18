@@ -6,6 +6,8 @@ Start with: streamlit run live_traffic_dashboard.py
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+import json
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -38,6 +40,8 @@ CAR_COLOR_HEX = {
     1: "#242424", 2: "#f3f3f3", 3: "#808080", 4: "#c0c0c0", 5: "#e53935",
     6: "#2d82d7", 7: "#41a85f", 8: "#f5dc28", 9: "#ff8c00", 10: "#874b2a",
 }
+LIVE_PREVIEW_PATH = Path("outputs/live_preview.jpg")
+LIVE_STATUS_PATH = Path("outputs/live_dashboard.json")
 
 
 def csv_files():
@@ -62,6 +66,38 @@ def load_local_data():
         return None
     return load_counts(files)
 
+
+def load_live_snapshot() -> dict | None:
+    """Read the locally published counter state; no network request is involved."""
+    try:
+        return json.loads(LIVE_STATUS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+@st.fragment(run_every="0.333s")
+def render_live_camera_dashboard() -> None:
+    snapshot = load_live_snapshot()
+    if snapshot is None or not LIVE_PREVIEW_PATH.is_file():
+        st.info("Start counter.py to publish the local camera dashboard.")
+        return
+    st.subheader("Live camera")
+    st.caption(f"Local snapshot: {snapshot.get('timestamp', 'unknown time')}")
+    st.image(str(LIVE_PREVIEW_PATH), use_container_width=True)
+    metrics = snapshot.get("metrics", {})
+    cards = st.columns(6)
+    for column, (label, value) in zip(
+        cards,
+        (
+            ("Cloud", f"{metrics.get('cloud_ms', 0)} ms"),
+            ("YOLO", f"{metrics.get('yolo_ms', 0)} ms"),
+            ("CLIP", f"{metrics.get('clip_ms', 0)} ms"),
+            ("Other cloud", f"{metrics.get('other_cloud_ms', 0)} ms"),
+            ("Process", f"{metrics.get('process_fps', 0)} FPS"),
+            ("Render", f"{metrics.get('render_fps', 0)} FPS"),
+        ),
+    ):
+        column.metric(label, value)
 
 def fetch_supabase_rows(
     url: str,
@@ -212,6 +248,8 @@ def render_color_pie(data: pd.DataFrame, timeframe: tuple[datetime, datetime]) -
 st.set_page_config(page_title="Live traffic flow", layout="wide")
 st.title("Live traffic flow")
 st.caption(f"The selected day refreshes every {REFRESH_INTERVAL_LABEL} while this page is open.")
+render_live_camera_dashboard()
+st.divider()
 
 selected_day = st.date_input("Day", value=latest_day())
 visible_traces = st.multiselect(
@@ -235,6 +273,41 @@ def render_live_chart() -> None:
     if day_data.empty:
         st.info(f"No counted vehicles for {selected_day.isoformat()} yet.")
         return
+
+    count_panel, color_panel = st.columns([2, 1])
+    with count_panel:
+        available_start = day_data["timestamp"].min().to_pydatetime()
+        available_end = day_data["timestamp"].max().to_pydatetime()
+        if available_start == available_end:
+            st.caption(f"Only one count is available at {available_start:%H:%M}.")
+            count_timeframe = (available_start, available_end)
+        else:
+            slider_key = f"object_count_timeframe_{selected_day.isoformat()}"
+            if slider_key not in st.session_state:
+                st.session_state[slider_key] = (available_start, available_end)
+            else:
+                saved_start, saved_end = st.session_state[slider_key]
+                bounded_start = max(available_start, min(saved_start, available_end))
+                bounded_end = max(available_start, min(saved_end, available_end))
+                st.session_state[slider_key] = (
+                    (available_start, available_end)
+                    if bounded_start > bounded_end
+                    else (bounded_start, bounded_end)
+                )
+            count_timeframe = st.slider(
+                "Object-count timeframe",
+                min_value=available_start,
+                max_value=available_end,
+                step=timedelta(minutes=15),
+                format="HH:mm",
+                help="Drag the two handles to choose the start and end of the available count data.",
+                key=slider_key,
+            )
+        render_object_counts(day_data, count_timeframe)
+    with color_panel:
+        render_color_pie(day_data, count_timeframe)
+
+    st.divider()
 
     main_vehicle_types = tuple(
         vehicle_type
@@ -287,40 +360,5 @@ def render_live_chart() -> None:
         f"Lines use a {CONTINUOUS_FLOW_ROLLING_AVERAGE_MINUTES}-minute rolling average. "
         "Use the Shown lines selector above to show or hide them."
     )
-
-    st.divider()
-    count_panel, color_panel = st.columns([2, 1])
-    with count_panel:
-        available_start = day_data["timestamp"].min().to_pydatetime()
-        available_end = day_data["timestamp"].max().to_pydatetime()
-        if available_start == available_end:
-            st.caption(f"Only one count is available at {available_start:%H:%M}.")
-            count_timeframe = (available_start, available_end)
-        else:
-            slider_key = f"object_count_timeframe_{selected_day.isoformat()}"
-            if slider_key not in st.session_state:
-                st.session_state[slider_key] = (available_start, available_end)
-            else:
-                saved_start, saved_end = st.session_state[slider_key]
-                bounded_start = max(available_start, min(saved_start, available_end))
-                bounded_end = max(available_start, min(saved_end, available_end))
-                st.session_state[slider_key] = (
-                    (available_start, available_end)
-                    if bounded_start > bounded_end
-                    else (bounded_start, bounded_end)
-                )
-            count_timeframe = st.slider(
-                "Object-count timeframe",
-                min_value=available_start,
-                max_value=available_end,
-                step=timedelta(minutes=15),
-                format="HH:mm",
-                help="Drag the two handles to choose the start and end of the available count data.",
-                key=slider_key,
-            )
-        render_object_counts(day_data, count_timeframe)
-    with color_panel:
-        render_color_pie(day_data, count_timeframe)
-
 
 render_live_chart()

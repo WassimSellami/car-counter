@@ -4,6 +4,7 @@ from collections import Counter, defaultdict, deque
 import csv
 import ctypes
 from datetime import date, datetime, timedelta
+import json
 import logging
 import os
 from pathlib import Path
@@ -38,6 +39,7 @@ from constants import (
     LIGHT_MIN_AREA,
     LIGHT_TRACK_DISTANCE,
     LIGHT_TRACK_MAX_MISSING,
+    LIVE_DASHBOARD_PUBLISH_INTERVAL_SECONDS,
     MIN_DIRECTION_DISTANCE_RATIO,
     NIGHT_MODE,
     SELECT_CROP_ON_START,
@@ -342,6 +344,7 @@ class VehicleCounter:
         self.inference_finished = Event()
         self.cloud_error: str | None = None
         self.mouse_position: tuple[int, int] | None = None
+        self.next_dashboard_publish_at = 0.0
         self.last_track_cleanup_time = time.perf_counter()
 
         if NIGHT_MODE:
@@ -541,6 +544,7 @@ class VehicleCounter:
         self.render_fps = float(len(self.rendered_frame_times))
 
     def _show_frame(self, frame: np.ndarray) -> None:
+        self._publish_live_dashboard(frame)
         dashboard = _dashboard(
             frame,
             self.display_width,
@@ -556,6 +560,51 @@ class VehicleCounter:
             self.mouse_position,
         )
         cv2.imshow("Car Counter", dashboard)
+
+    def _publish_live_dashboard(self, frame: np.ndarray) -> None:
+        """Publish a low-rate local snapshot for the Streamlit dashboard."""
+        now = time.perf_counter()
+        if now < self.next_dashboard_publish_at:
+            return
+        self.next_dashboard_publish_at = now + LIVE_DASHBOARD_PUBLISH_INTERVAL_SECONDS
+        output_directory = Path("outputs")
+        output_directory.mkdir(exist_ok=True)
+        encoded, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not encoded:
+            return
+        into_direction = Direction.RIGHT if INTO_PASSAU_IS_RIGHT else Direction.LEFT
+        out_direction = Direction.LEFT if INTO_PASSAU_IS_RIGHT else Direction.RIGHT
+        snapshot = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "metrics": {
+                "cloud_ms": round(self.cloud_delay_ms),
+                "yolo_ms": round(self.yolo_ms),
+                "clip_ms": round(self.clip_ms),
+                "other_cloud_ms": round(max(0, self.cloud_delay_ms - self.yolo_ms - self.clip_ms)),
+                "process_fps": round(self.fps, 1),
+                "render_fps": round(self.render_fps, 1),
+            },
+            "counts": {
+                vehicle_type.name.lower(): {
+                    "into_passau": self.vehicle_counts[(vehicle_type, into_direction)],
+                    "out_of_passau": self.vehicle_counts[(vehicle_type, out_direction)],
+                }
+                for vehicle_type in VehicleType
+            },
+            "colors": {color.name.lower(): count for color, count in self.color_counts.items() if count},
+        }
+        try:
+            preview_path = output_directory / "live_preview.jpg"
+            preview_temp_path = output_directory / "live_preview.tmp.jpg"
+            preview_temp_path.write_bytes(jpeg.tobytes())
+            preview_temp_path.replace(preview_path)
+            status_path = output_directory / "live_dashboard.json"
+            status_temp_path = output_directory / "live_dashboard.tmp.json"
+            status_temp_path.write_text(json.dumps(snapshot), encoding="utf-8")
+            status_temp_path.replace(status_path)
+        except OSError:
+            # A dashboard read must never interrupt vehicle counting.
+            return
 
     def _on_mouse(self, event: int, x: int, y: int, _flags: int, _params: object) -> None:
         if event == cv2.EVENT_MOUSEMOVE:
