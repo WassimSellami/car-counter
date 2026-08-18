@@ -43,6 +43,16 @@ def parse_arguments() -> argparse.Namespace:
         default=5.0,
         help="Seconds between scans for newly appended rows (default: 5).",
     )
+    parser.add_argument(
+        "--repair-colors",
+        action="store_true",
+        help="Add a missing color column with 0 (unknown) to every count CSV.",
+    )
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Delete all traffic_counts rows before syncing the local archive once.",
+    )
     return parser.parse_args()
 
 
@@ -80,6 +90,30 @@ def rows_from_csv(csv_path: Path) -> list[dict]:
     return rows
 
 
+def repair_missing_color_columns() -> int:
+    """Add the current CSV color field without changing existing rows."""
+    repaired = 0
+    for csv_path in discover_count_csv_files():
+        with csv_path.open("r", newline="", encoding="utf-8") as csv_file:
+            reader = csv.DictReader(csv_file)
+            fieldnames = reader.fieldnames or []
+            if "color" in fieldnames:
+                continue
+            rows = list(reader)
+        fields = list(fieldnames)
+        fields.insert(fields.index("time_of_day"), "color")
+        temporary_path = csv_path.with_suffix(".tmp")
+        with temporary_path.open("w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fields)
+            writer.writeheader()
+            for row in rows:
+                row["color"] = 0
+                writer.writerow(row)
+        temporary_path.replace(csv_path)
+        repaired += 1
+    return repaired
+
+
 def upload_rows(url: str, service_key: str, rows: list[dict]) -> int:
     for start in range(0, len(rows), BATCH_SIZE):
         batch = rows[start : start + BATCH_SIZE]
@@ -99,6 +133,16 @@ def upload_rows(url: str, service_key: str, rows: list[dict]) -> int:
     return len(rows)
 
 
+def delete_all_rows(url: str, service_key: str) -> None:
+    response = requests.delete(
+        f"{url}/rest/v1/traffic_counts",
+        params={"record_id": "not.is.null"},
+        headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"},
+        timeout=60,
+    )
+    response.raise_for_status()
+
+
 def sync_once(url: str, service_key: str) -> int:
     uploaded = 0
     for csv_path in discover_count_csv_files():
@@ -113,6 +157,14 @@ def main() -> None:
 
     load_dotenv()
     url, service_key = supabase_settings()
+    if arguments.repair_colors:
+        print(f"Added color=0 to {repair_missing_color_columns()} CSV file(s).", flush=True)
+    if arguments.replace:
+        print("Deleting all existing Supabase traffic_counts rows...", flush=True)
+        delete_all_rows(url, service_key)
+        rows = sync_once(url, service_key)
+        print(f"Replaced Supabase data with {rows:,} local row(s).", flush=True)
+        return
     print("Syncing counter CSVs to Supabase. Press Ctrl+C to stop this sync only.")
     while True:
         try:
