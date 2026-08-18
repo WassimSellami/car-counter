@@ -11,6 +11,8 @@ CAMERA_SOURCE = 0
 # DroidCam delivers a stable 30 FPS to Windows. Render cloud result batches at
 # this cadence instead of showing each returned batch in a burst.
 DISPLAY_FPS = 30
+# Set False if vehicles entering Passau move left in this camera view.
+INTO_PASSAU_IS_RIGHT = True
 # Keep two cloud batches ready before playback so cloud/network jitter does not
 # make the local 30-FPS display stutter.
 DISPLAY_BUFFER_FRAMES = CLOUD_BATCH_SIZE * 2
@@ -58,8 +60,7 @@ LIGHT_GROUP_X_DISTANCE = 60
 LIGHT_GROUP_Y_DISTANCE = 25
 LIGHT_TRACK_DISTANCE = 90
 LIGHT_TRACK_MAX_MISSING = 45
-# Draw the detection crop interactively at program startup. Select the road,
-# then press Enter or Space to confirm.
+# Select four road corners interactively at startup, then rectify the road.
 SELECT_CROP_ON_START = True
 # A vehicle must move at least this fraction of the frame width before it is
 # counted. This prevents small tracker jitter from being counted as movement.

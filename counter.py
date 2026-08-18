@@ -2,6 +2,7 @@
 
 from collections import defaultdict, deque
 import csv
+import ctypes
 from datetime import date, datetime, timedelta
 import logging
 import os
@@ -28,6 +29,7 @@ from constants import (
     CONFIDENCE,
     DISPLAY_BUFFER_FRAMES,
     DISPLAY_FPS,
+    INTO_PASSAU_IS_RIGHT,
     LIGHT_BRIGHTNESS_THRESHOLD,
     LIGHT_GROUP_X_DISTANCE,
     LIGHT_GROUP_Y_DISTANCE,
@@ -194,8 +196,8 @@ def _open_csv_writer(day: date) -> tuple[Path, TextIO, csv.DictWriter, dict[tupl
     return csv_path, csv_file, csv_writer, counts, next_record_id
 
 
-def _select_startup_crop() -> tuple[int, int, int, int]:
-    """Show the camera preview and choose the crop before scheduled detection."""
+def _select_startup_road() -> tuple[np.ndarray, tuple[int, int]]:
+    """Show the camera preview and choose a four-corner road projection."""
     camera = open_camera(CAMERA_SOURCE, CAMERA_WIDTH, CAMERA_HEIGHT)
     if not camera.isOpened():
         raise RuntimeError(f"Could not open camera source {CAMERA_SOURCE}")
@@ -208,13 +210,18 @@ def _select_startup_crop() -> tuple[int, int, int, int]:
 
             if not SELECT_CROP_ON_START:
                 frame_height, frame_width = frame.shape[:2]
-                return 0, 0, frame_width, frame_height
+                return (
+                    np.float32(
+                        [[0, 0], [frame_width - 1, 0], [frame_width - 1, frame_height - 1], [0, frame_height - 1]]
+                    ),
+                    (frame_width, frame_height),
+                )
 
             cv2.imshow("Camera Preview", frame)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("s"):
                 cv2.destroyWindow("Camera Preview")
-                return _select_crop(frame)
+                return _select_road_projection(frame)
             if key == ord("q"):
                 raise SystemExit(0)
     finally:
@@ -238,8 +245,16 @@ def _wait_for_scheduled_start() -> None:
         time.sleep(min(remaining, 60))
 
 
+def _screen_size() -> tuple[int, int]:
+    """Return the usable Windows desktop size, with a sensible fallback."""
+    try:
+        return ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1)
+    except AttributeError:
+        return 1600, 900
+
+
 class VehicleCounter:
-    def __init__(self, crop: tuple[int, int, int, int]) -> None:
+    def __init__(self, road_points: np.ndarray, road_size: tuple[int, int]) -> None:
         _load_dotenv()
         self.cloud_url = os.environ.get("CLOUD_INFERENCE_URL", "")
         self.cloud_batch_url = self.cloud_url.rsplit("/", 1)[0] + "/infer-batch" if self.cloud_url else ""
@@ -266,11 +281,21 @@ class VehicleCounter:
             self.supabase_uploader.close()
             raise RuntimeError(f"Could not open camera source {CAMERA_SOURCE}")
 
-        self.crop_x, self.crop_y, self.crop_width, self.crop_height = crop
+        self.road_width, self.road_height = road_size
+        destination_points = np.float32(
+            [
+                [0, 0],
+                [self.road_width - 1, 0],
+                [self.road_width - 1, self.road_height - 1],
+                [0, self.road_height - 1],
+            ]
+        )
+        self.road_projection = cv2.getPerspectiveTransform(road_points, destination_points)
+        self.display_width, self.display_height = _screen_size()
         self.track_history: dict[int, list[int]] = defaultdict(list)
         self.counted_ids: set[int] = set()
         self.minimum_distances = {
-            vehicle_type: max(25, int(self.crop_width * _direction_distance_ratio(vehicle_type)))
+            vehicle_type: max(25, int(self.road_width * _direction_distance_ratio(vehicle_type)))
             for vehicle_type in VehicleType
         }
         self.time_of_day_value = int(TimeOfDay.NIGHT if NIGHT_MODE else TimeOfDay.DAY)
@@ -465,11 +490,10 @@ class VehicleCounter:
         self.render_fps = float(len(self.rendered_frame_times))
 
     def _show_frame(self, frame: np.ndarray) -> None:
-        display_height = max(frame.shape[0], 530)
-        video_area = np.zeros((display_height, frame.shape[1], 3), dtype=np.uint8)
-        video_area[: frame.shape[0], :] = frame
-        panel = _status_panel(
-            display_height,
+        dashboard = _dashboard(
+            frame,
+            self.display_width,
+            self.display_height,
             self.vehicle_counts,
             self.fps,
             self.render_fps,
@@ -477,7 +501,7 @@ class VehicleCounter:
             self.yolo_ms,
             self.local_ms,
         )
-        cv2.imshow("Car Counter", np.hstack((video_area, panel)))
+        cv2.imshow("Car Counter", dashboard)
 
     def _queue_display_frame(self, frame: np.ndarray) -> None:
         while not self.stop_event.is_set():
@@ -493,12 +517,9 @@ class VehicleCounter:
                 success, frame = self.camera.read()
                 if not success:
                     return
-                frame = frame[
-                    self.crop_y : self.crop_y + self.crop_height,
-                    self.crop_x : self.crop_x + self.crop_width,
-                ]
+                frame = cv2.warpPerspective(frame, self.road_projection, (self.road_width, self.road_height))
                 if frame.size == 0:
-                    raise RuntimeError("Crop is empty; restart and select a valid crop")
+                    raise RuntimeError("Road projection is empty; restart and select a valid road")
                 captured_frame = (frame, time.perf_counter())
                 try:
                     self.capture_queue.put(captured_frame, timeout=0.01)
@@ -558,6 +579,8 @@ class VehicleCounter:
         worker = Thread(target=self._inference_loop, daemon=True)
         capture_worker.start()
         worker.start()
+        cv2.namedWindow("Car Counter", cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty("Car Counter", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         next_display_at = time.perf_counter()
         display_started = False
         try:
@@ -594,8 +617,10 @@ class VehicleCounter:
             self.supabase_uploader.close()
 
 
-def _status_panel(
-    frame_height: int,
+def _dashboard(
+    frame: np.ndarray,
+    width: int,
+    height: int,
     vehicle_counts: dict[tuple[VehicleType, Direction], int],
     fps: float,
     render_fps: float,
@@ -603,89 +628,113 @@ def _status_panel(
     yolo_ms: float,
     local_ms: float,
 ) -> np.ndarray:
-    """Create a sidebar that is separate from the camera image."""
-    panel = np.full((frame_height, 430, 3), (28, 28, 28), dtype=np.uint8)
-    text_color = (220, 220, 220)
-    left_color = (0, 255, 255)
-    right_color = (0, 255, 0)
-    cv2.putText(panel, "OBJECT COUNTS", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.85, text_color, 2)
-    cv2.putText(panel, "TYPE", (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
-    cv2.putText(panel, "LEFT", (205, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, left_color, 2)
-    cv2.putText(panel, "RIGHT", (315, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, right_color, 2)
-    cv2.line(panel, (15, 100), (415, 100), (90, 90, 90), 1)
+    """Build the fullscreen monitoring dashboard around the camera image."""
+    background = (20, 23, 28)
+    surface = np.full((height, width, 3), background, dtype=np.uint8)
+    margin = 28
+    header_height = 112
+    footer_height = 270
+    video_max_width = width - 2 * margin
+    video_max_height = height - header_height - footer_height - 3 * margin
+    scale = min(video_max_width / frame.shape[1], video_max_height / frame.shape[0])
+    video_width = max(1, round(frame.shape[1] * scale))
+    video_height = max(1, round(frame.shape[0] * scale))
+    interpolation = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+    video = cv2.resize(frame, (video_width, video_height), interpolation=interpolation)
+    video_x = (width - video_width) // 2
+    video_y = header_height + margin
+    surface[video_y : video_y + video_height, video_x : video_x + video_width] = video
 
+    white = (235, 238, 242)
+    muted = (150, 160, 172)
+    into_color = (70, 235, 70)
+    out_color = (0, 190, 255)
+    card_color = (33, 38, 46)
+    cv2.putText(surface, "CLOUD VEHICLE COUNTER", (margin, 39), cv2.FONT_HERSHEY_SIMPLEX, 0.82, white, 2)
+    cv2.putText(surface, "LIVE ROAD ANALYTICS", (margin, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.48, muted, 1)
+
+    metrics = [
+        ("CLOUD", f"{cloud_delay_ms:.0f} ms / {CLOUD_BATCH_SIZE}"),
+        ("YOLO", f"{yolo_ms:.0f} ms / {CLOUD_BATCH_SIZE}"),
+        ("PROCESS", f"{fps:.1f} FPS"),
+        ("RENDER", f"{render_fps:.1f} FPS"),
+    ]
+    card_width = 185
+    card_height = 68
+    for index, (label, value) in enumerate(metrics):
+        x = width - margin - (len(metrics) - index) * (card_width + 10) + 10
+        cv2.rectangle(surface, (x, 20), (x + card_width, 20 + card_height), card_color, -1)
+        cv2.putText(surface, label, (x + 14, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.43, muted, 1)
+        cv2.putText(surface, value, (x + 14, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.56, white, 2)
+
+    footer_y = video_y + video_height + 18
+    cv2.putText(surface, "OBJECT COUNTS", (margin, footer_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.72, white, 2)
     rows = [
         ("Car / van", VehicleType.CAR),
         ("Truck", VehicleType.TRUCK),
         ("Bus", VehicleType.BUS),
         ("Bicycle", VehicleType.BICYCLE),
     ]
-    for row_index, (label, vehicle_type) in enumerate(rows):
-        y = 145 + row_index * 58
-        cv2.putText(panel, label, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
-        cv2.putText(
-            panel,
-            str(vehicle_counts[(vehicle_type, Direction.LEFT)]),
-            (220, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.85,
-            left_color,
-            2,
-        )
-        cv2.putText(
-            panel,
-            str(vehicle_counts[(vehicle_type, Direction.RIGHT)]),
-            (335, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.85,
-            right_color,
-            2,
-        )
-        cv2.line(panel, (15, y + 18), (415, y + 18), (55, 55, 55), 1)
+    table_x = margin
+    table_y = footer_y + 42
+    table_width = width - 2 * margin
+    header_row_height = 42
+    row_height = 45
+    type_width = int(table_width * 0.46)
+    direction_width = (table_width - type_width) // 2
+    table_height = header_row_height + row_height * len(rows)
+    cv2.rectangle(surface, (table_x, table_y), (table_x + table_width, table_y + table_height), card_color, -1)
+    cv2.rectangle(surface, (table_x, table_y), (table_x + table_width, table_y + header_row_height), (44, 51, 60), -1)
+    into_direction = Direction.RIGHT if INTO_PASSAU_IS_RIGHT else Direction.LEFT
+    out_direction = Direction.LEFT if INTO_PASSAU_IS_RIGHT else Direction.RIGHT
+    cv2.putText(surface, "VEHICLE TYPE", (table_x + 18, table_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, muted, 1)
+    cv2.putText(surface, "INTO PASSAU", (table_x + type_width + 18, table_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, into_color, 1)
+    cv2.putText(surface, "OUT OF PASSAU", (table_x + type_width + direction_width + 18, table_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, out_color, 1)
+    for index, (label, vehicle_type) in enumerate(rows):
+        y = table_y + header_row_height + index * row_height
+        if index % 2 == 1:
+            cv2.rectangle(surface, (table_x, y), (table_x + table_width, y + row_height), (37, 43, 51), -1)
+        baseline = y + 33
+        cv2.putText(surface, label, (table_x + 18, baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.66, white, 2)
+        cv2.putText(surface, str(vehicle_counts[(vehicle_type, into_direction)]), (table_x + type_width + 18, baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.95, into_color, 2)
+        cv2.putText(surface, str(vehicle_counts[(vehicle_type, out_direction)]), (table_x + type_width + direction_width + 18, baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.95, out_color, 2)
+        cv2.line(surface, (table_x, y + row_height), (table_x + table_width, y + row_height), (54, 61, 70), 1)
 
-    cv2.putText(panel, f"Cloud  {cloud_delay_ms:.0f} ms / {CLOUD_BATCH_SIZE}", (20, 365), cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_color, 2)
-    cv2.putText(panel, f"YOLO   {yolo_ms:.0f} ms / {CLOUD_BATCH_SIZE}", (20, 395), cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_color, 2)
-    cv2.putText(panel, f"Local  {local_ms:.0f} ms", (20, 425), cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_color, 2)
-    cv2.putText(panel, f"Process  {fps:.1f} FPS", (20, 465), cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_color, 2)
-    cv2.putText(panel, f"Render   {render_fps:.1f} FPS", (20, 500), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
-    return panel
+    cv2.putText(surface, f"Local overhead {local_ms:.0f} ms", (width - 225, footer_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.42, muted, 1)
+    return surface
 
 
-def _select_crop(frame: np.ndarray) -> tuple[int, int, int, int]:
-    """Select a crop without OpenCV's terminal output."""
-    window_name = "Select Road Crop"
-    start: tuple[int, int] | None = None
-    selection: tuple[int, int, int, int] | None = None
+def _select_road_projection(frame: np.ndarray) -> tuple[np.ndarray, tuple[int, int]]:
+    """Select road corners in CamScanner order: TL, TR, BR, BL."""
+    window_name = "Select road: click TL, TR, BR, BL; then Enter"
+    points: list[tuple[int, int]] = []
 
     def on_mouse(event: int, x: int, y: int, _flags: int, _params: object) -> None:
-        nonlocal start, selection
-        if event == cv2.EVENT_LBUTTONDOWN:
-            start = (x, y)
-            selection = None
-        elif event == cv2.EVENT_MOUSEMOVE and start is not None:
-            left, top = min(start[0], x), min(start[1], y)
-            selection = (left, top, abs(x - start[0]), abs(y - start[1]))
-        elif event == cv2.EVENT_LBUTTONUP and start is not None:
-            left, top = min(start[0], x), min(start[1], y)
-            selection = (left, top, abs(x - start[0]), abs(y - start[1]))
-            start = None
+        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
+            points.append((x, y))
 
     cv2.namedWindow(window_name)
     cv2.setMouseCallback(window_name, on_mouse)
     while True:
         preview = frame.copy()
-        if selection is not None:
-            x, y, width, height = selection
-            cv2.rectangle(preview, (x, y), (x + width, y + height), (0, 255, 0), 2)
+        for index, point in enumerate(points, start=1):
+            cv2.circle(preview, point, 6, (0, 255, 0), -1)
+            cv2.putText(preview, str(index), (point[0] + 8, point[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        if len(points) > 1:
+            cv2.polylines(preview, [np.int32(points)], len(points) == 4, (0, 255, 0), 2)
+        cv2.putText(preview, "1=top-left  2=top-right  3=bottom-right  4=bottom-left", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
         cv2.imshow(window_name, preview)
         key = cv2.waitKey(1) & 0xFF
-        if key in (13, 32) and selection is not None and selection[2] and selection[3]:
+        if key in (13, 32) and len(points) == 4:
+            source_points = np.float32(points)
+            top = np.linalg.norm(source_points[1] - source_points[0])
+            bottom = np.linalg.norm(source_points[2] - source_points[3])
+            left = np.linalg.norm(source_points[3] - source_points[0])
+            right = np.linalg.norm(source_points[2] - source_points[1])
             cv2.destroyWindow(window_name)
-            return selection
-        if key == ord("c"):
-            cv2.destroyWindow(window_name)
-            height, width = frame.shape[:2]
-            return 0, 0, width, height
+            return source_points, (max(2, round(max(top, bottom))), max(2, round(max(left, right))))
+        if key == ord("r"):
+            points.clear()
 
 
 class MovingLightTracker:
@@ -774,9 +823,9 @@ class MovingLightTracker:
 
 
 def main() -> None:
-    crop = _select_startup_crop()
+    road_points, road_size = _select_startup_road()
     _wait_for_scheduled_start()
-    counter = VehicleCounter(crop)
+    counter = VehicleCounter(road_points, road_size)
     counter.run()
 
 if __name__ == "__main__":
