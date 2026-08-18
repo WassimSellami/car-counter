@@ -46,6 +46,7 @@ from constants import (
     START_MINUTES,
     TRACK_MEMORY_SECONDS,
     TRUCK_CLASS_ID,
+    UPLOAD_TO_SUPABASE,
 )
 from camera_utils import open_camera
 from cloud_detection_client import INFERENCE_WIDTH, JPEG_QUALITY, infer_frame_batch
@@ -103,10 +104,10 @@ class SupabaseCountUploader:
         self.url = os.environ.get("SUPABASE_URL", "").rstrip("/")
         self.service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
         self.queue: Queue[dict | None] = Queue()
-        if not self.url or not self.service_key:
-            raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env")
-        self.worker: Thread | None = Thread(target=self._upload_loop, daemon=True)
-        self.worker.start()
+        self.worker: Thread | None = None
+        if UPLOAD_TO_SUPABASE and self.url and self.service_key:
+            self.worker = Thread(target=self._upload_loop, daemon=True)
+            self.worker.start()
 
     def submit(self, row: dict) -> None:
         if self.worker is not None:

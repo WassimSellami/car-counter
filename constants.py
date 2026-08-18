@@ -1,6 +1,9 @@
 START_IMMEDIATELY = True
 START_HOURS = 5
 START_MINUTES = 15
+# Set True only when you want new count rows uploaded to Supabase.
+# CSV files are always saved locally.
+UPLOAD_TO_SUPABASE = False
 # Frames sent together for cloud inference. Higher values trade more delay for throughput.
 CLOUD_BATCH_SIZE = 10
 # DroidCam virtual webcam index on Windows.
