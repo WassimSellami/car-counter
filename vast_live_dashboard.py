@@ -1,7 +1,8 @@
 """Vast Streamlit dashboard: live stream plus Supabase-backed history."""
 
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -17,6 +18,7 @@ PUBLIC_COUNTER_URL = os.environ.get("COUNTER_PUBLIC_URL", COUNTER_URL).rstrip("/
 API_KEY = os.environ["CLOUD_INFERENCE_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+GERMANY = ZoneInfo("Europe/Berlin")
 COLOR_NAMES = {1: "black", 2: "white", 3: "grey", 4: "silver", 5: "red", 6: "blue", 7: "green", 8: "yellow", 9: "orange", 10: "brown"}
 COLOR_HEX = {"black": "#242424", "white": "#f3f3f3", "grey": "#808080", "silver": "#c0c0c0", "red": "#e53935", "blue": "#2d82d7", "green": "#41a85f", "yellow": "#f5dc28", "orange": "#ff8c00", "brown": "#874b2a"}
 TRACE_NAMES = [f"{vehicle_type} — {direction}" for vehicle_type in VEHICLE_TYPE_LABELS.values() if vehicle_type != "Bicycle" for direction in ("Into Passau", "Out of Passau")]
@@ -35,11 +37,13 @@ def status() -> dict | None:
 @st.cache_data(ttl=10, show_spinner=False)
 def load_cloud_counts(selected_day: date) -> pd.DataFrame | None:
     next_day = selected_day + timedelta(days=1)
+    utc_start = datetime.combine(selected_day, time.min, GERMANY).astimezone(timezone.utc).isoformat()
+    utc_end = datetime.combine(next_day, time.min, GERMANY).astimezone(timezone.utc).isoformat()
     rows, offset = [], 0
     while True:
         response = requests.get(
             f"{SUPABASE_URL}/rest/v1/traffic_counts",
-            params=[("select", "record_id,timestamp,direction,vehicle_type,color"), ("timestamp", f"gte.{selected_day.isoformat()}T00:00:00"), ("timestamp", f"lt.{next_day.isoformat()}T00:00:00"), ("order", "timestamp.asc,record_id.asc"), ("limit", 1000), ("offset", offset)],
+            params=[("select", "record_id,timestamp,direction,vehicle_type,color"), ("timestamp", f"gte.{utc_start}"), ("timestamp", f"lt.{utc_end}"), ("order", "timestamp.asc,record_id.asc"), ("limit", 1000), ("offset", offset)],
             headers=supabase_headers(), timeout=15,
         )
         response.raise_for_status()
@@ -48,7 +52,11 @@ def load_cloud_counts(selected_day: date) -> pd.DataFrame | None:
         if len(page) < 1000:
             break
         offset += 1000
-    return normalise_counts(pd.DataFrame(rows)) if rows else None
+    if not rows:
+        return None
+    data = normalise_counts(pd.DataFrame(rows))
+    data["timestamp"] = pd.to_datetime(data["timestamp"], utc=True).dt.tz_convert(GERMANY).dt.tz_localize(None)
+    return data
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -56,7 +64,7 @@ def latest_cloud_day() -> date:
     response = requests.get(f"{SUPABASE_URL}/rest/v1/traffic_counts", params={"select": "timestamp", "order": "timestamp.desc", "limit": 1}, headers=supabase_headers(), timeout=15)
     response.raise_for_status()
     rows = response.json()
-    return pd.to_datetime(rows[0]["timestamp"]).date() if rows else date.today()
+    return pd.to_datetime(rows[0]["timestamp"], utc=True).tz_convert(GERMANY).date() if rows else datetime.now(GERMANY).date()
 
 
 def render_counts(data: pd.DataFrame | None) -> None:
