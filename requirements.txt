@@ -1,7 +1,0 @@
-opencv-python
-ultralytics
-pandas
-plotly
-streamlit
-requests
-transformers

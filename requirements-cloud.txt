@@ -1,0 +1,13 @@
+# Vast already provides the CUDA-compatible PyTorch build. Do not install torch here.
+opencv-python-headless
+numpy
+ultralytics
+transformers
+fastapi
+uvicorn
+python-multipart
+requests
+pandas
+plotly
+streamlit
+Pillow

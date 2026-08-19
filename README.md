@@ -1,135 +1,224 @@
-# Directional Vehicle Counter
+# Cloud Vehicle Counter
 
-Counts vehicles independently by their direction of horizontal movement.
+The system is split between two machines:
 
-## Run
+| Where | Runs | Responsibility |
+| --- | --- | --- |
+| Local PC (camera access) | `cloud_camera_sender.py` | Captures DroidCam, lets you select the road, rectifies/crops it, resizes frames to 640 px wide, and sends batches to Vast. |
+| Vast GPU machine | `vast_counter_server.py` | YOLO vehicle detection, ByteTrack tracking, CLIP car-colour classification, counting, annotated video, CSV writing, and optional Supabase upload. |
+| Vast GPU machine | `vast_live_dashboard.py` | Streamlit dashboard: annotated live video from the counter and historical counts from Supabase. |
+
+The local PC does **not** run YOLO in this architecture. It only needs camera access and sends cropped JPEG frames. The Vast machine is the source of new CSV files and Supabase rows.
+
+## 1. Local PC setup
+
+From the project folder:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python find_camera.py
+pip install -r requirements-local.txt
 ```
 
-Set `CAMERA_INDEX` in `view_camera.py` and `car_counter.py` to the DroidCam index.
-`car_counter.py` requests a 1920×1080 feed by default; change `CAMERA_WIDTH` and
-`CAMERA_HEIGHT` there if your DroidCam plan or phone supports a different size.
+Set the DroidCam camera index and requested capture resolution in [constants.py](constants.py). Usually `CAMERA_SOURCE = 0` works for DroidCam.
 
-```powershell
-python view_camera.py
-python car_counter.py
+Create the ignored `.env` file beside this README:
+
+```dotenv
+# Vast public mapping for the instance's internal port 8000.
+COUNTER_PUBLIC_URL=http://YOUR_VAST_IP:YOUR_PUBLIC_8000_PORT
+
+# Choose a long random secret. It must exactly match the cloud value.
+CLOUD_INFERENCE_API_KEY=YOUR_LONG_RANDOM_SECRET
 ```
 
-`view_camera.py` first measures the source for five seconds and prints its actual
-resolution and FPS. This measures the DroidCam feed without YOLO inference.
-
-Press `q` to close either video window. The first run downloads `yolo11n.pt`.
-
-There is no counting line. A tracked car is counted once after it moves horizontally by at least `MIN_DIRECTION_DISTANCE_RATIO` of the frame width. Movement right increments `Going right`; movement left increments `Going left`.
-
-Each calendar day has one CSV at `outputs/YYYY-MM-DD/count_YYYYMMDD.csv`. On startup, the counter reads that day's existing rows and restores the displayed totals before appending new rows to the same file. It automatically switches to a new daily file at midnight. A row is written and flushed immediately for every counted vehicle: `0.40` confidence for cars/vans, trucks, and buses; `0.10` for bicycles. Its columns are `id`, `timestamp`, `direction` (`0` = left, `1` = right), `vehicle_type` (`0` = car or van, `1` = truck, `2` = bus, `3` = bicycle), `time_of_day` (`0` = day, `1` = night), and `confidence`. The COCO model does not provide a separate van class, so vans are detected and recorded as cars.
-
-## Traffic analysis
-
-Generate one standalone interactive traffic-flow report per calendar day with:
+Run the camera sender:
 
 ```powershell
-pip install -r requirements.txt
+python cloud_camera_sender.py
+```
+
+Press `S` when the camera preview is visible. Click the road corners in this order: top-left, top-right, bottom-right, bottom-left, then press Enter. The selected trapezoid is projected into a straight road rectangle before it leaves the PC. Press `Ctrl+C` to stop sending.
+
+## 2. Create the Vast instance
+
+Choose a GPU instance and ensure Vast exposes these **internal** ports:
+
+| Internal port | Used by |
+| --- | --- |
+| `22` | SSH |
+| `8000` | Counter API / camera sender |
+| `8501` | Streamlit dashboard |
+
+Vast assigns a different public port to each internal port. For example, if Vast displays:
+
+```text
+82.225.150.130:15473 -> 8000/tcp
+82.225.150.130:15311 -> 8501/tcp
+82.225.150.130:15498 -> 22/tcp
+```
+
+then:
+
+```text
+Counter URL:  http://82.225.150.130:15473
+Dashboard:    http://82.225.150.130:15311
+SSH:          ssh -p 15498 root@82.225.150.130
+```
+
+Use the mappings shown for **your own** instance; they change when you rent a new machine.
+
+## 3. Deploy the cloud code from GitHub
+
+Commit and push code changes from the local PC before deploying them:
+
+```powershell
+git add .
+git commit -m "Describe the change"
+git push
+```
+
+SSH into Vast:
+
+```powershell
+ssh -p SSH_PORT root@VAST_IP
+```
+
+Clone the repository once:
+
+```bash
+git clone https://github.com/WassimSellami/car-counter.git /workspace/car-counter
+cd /workspace/car-counter
+```
+
+For later deployments, pull the committed code instead of uploading files:
+
+```bash
+cd /workspace/car-counter
+git pull --ff-only
+```
+
+Install the cloud dependencies:
+
+```bash
+/venv/main/bin/python -m pip install -r requirements-cloud.txt
+```
+
+Create the cloud environment file:
+
+```bash
+nano /root/counter.env
+```
+
+Paste the following, replacing every placeholder. `COUNTER_PUBLIC_URL` is the public mapping to internal port `8000`.
+
+```dotenv
+CLOUD_INFERENCE_API_KEY='THE_SAME_SECRET_AS_THE_LOCAL_PC'
+COUNTER_OUTPUT_DIR=/workspace/outputs
+UPLOAD_TO_SUPABASE=true
+COUNTER_INTERNAL_URL=http://127.0.0.1:8000
+COUNTER_PUBLIC_URL=http://YOUR_VAST_IP:YOUR_PUBLIC_8000_PORT
+SUPABASE_URL='https://YOUR-PROJECT.supabase.co'
+SUPABASE_SERVICE_ROLE_KEY='YOUR_SERVICE_ROLE_KEY'
+```
+
+Save with `Ctrl+O`, Enter, then exit with `Ctrl+X`.
+
+## 4. Start the cloud services
+
+Load the environment and start one counter process:
+
+```bash
+set -a
+source /root/counter.env
+set +a
+
+nohup /venv/main/bin/python -u /workspace/car-counter/vast_counter_server.py > /root/counter.log 2>&1 &
+```
+
+The first startup downloads model weights and can take a few minutes. Check it with:
+
+```bash
+tail -f /root/counter.log
+```
+
+Wait for:
+
+```text
+Uvicorn running on http://0.0.0.0:8000
+```
+
+Then start the dashboard:
+
+```bash
+nohup /venv/main/bin/python -m streamlit run /workspace/car-counter/vast_live_dashboard.py --server.address 0.0.0.0 --server.port 8501 > /root/dashboard.log 2>&1 &
+```
+
+Open the public Vast mapping for port `8501` in a browser. The dashboard's live video starts after `cloud_camera_sender.py` sends frames.
+
+## Restart after changing configuration or code
+
+On Vast, stop the old copies and start cleanly:
+
+```bash
+pkill -f '[v]ast_counter_server.py' || true
+pkill -f '[s]treamlit run /workspace/car-counter/vast_live_dashboard.py' || true
+sleep 3
+
+cd /workspace/car-counter
+git pull --ff-only
+
+set -a
+source /root/counter.env
+set +a
+
+nohup /venv/main/bin/python -u /workspace/car-counter/vast_counter_server.py > /root/counter.log 2>&1 &
+nohup /venv/main/bin/python -m streamlit run /workspace/car-counter/vast_live_dashboard.py --server.address 0.0.0.0 --server.port 8501 > /root/dashboard.log 2>&1 &
+```
+
+Use these logs to diagnose the cloud services:
+
+```bash
+tail -f /root/counter.log
+tail -f /root/dashboard.log
+```
+
+If you only change the local `.env`, stop and rerun `python cloud_camera_sender.py`; no cloud restart is needed.
+
+## Supabase data
+
+Create the `traffic_counts` table by running [supabase_setup.sql](supabase_setup.sql) in the Supabase SQL Editor. Keep the service-role key private and never commit `.env` or `/root/counter.env`.
+
+With `UPLOAD_TO_SUPABASE=true`, each newly counted vehicle is saved in both places:
+
+- Vast CSV: `/workspace/outputs/YYYY-MM-DD/count_YYYYMMDD.csv`
+- Supabase: `traffic_counts`
+
+The Vast dashboard always reads historical counts and car-colour charts from Supabase, so it includes archived data from previous Vast machines. Its live video, latency, and FPS values come from the currently running Vast counter.
+
+### One-time archive repair / replacement
+
+For a deliberate full rebuild of Supabase from the local `outputs` archive, first make a backup, then run locally:
+
+```powershell
+python sync_counts_to_supabase.py --repair-colors --replace
+```
+
+This adds a missing `color` column with value `0` (unknown) to old CSV files, **deletes every existing Supabase count**, and uploads the local archive. Do not use `--replace` during normal operation.
+
+## Offline analysis
+
+`vehicle_counter_analysis.py` creates an interactive HTML report from CSV files available on the machine where it is run:
+
+```powershell
 python vehicle_counter_analysis.py
 ```
 
-The script deliberately ignores `confidence` and `time_of_day`. It creates one
-self-contained interactive HTML report per calendar day, for example
-`outputs/analysis/traffic_flow_2026-08-12.html`; open it directly in any
-browser—no server is needed. The legend contains one entry for each vehicle
-type and direction, so clicking (for example) `Truck — Into Passau` shows or
-hides that line. The chart uses five-minute buckets by default, with category
-colours, solid Into-Passau lines, and dashed Out-of-Passau lines. Each line is
-a centred two-hour rolling average. The chart ends at the last recorded interval, so it does not
-add a trailing drop to zero.
+For cloud-generated CSVs, download the required `outputs` files first, or use the Supabase-backed Vast dashboard instead.
 
-### Live dashboard
+## Notes
 
-To watch one selected calendar day update while `car_counter.py` is running,
-open another PowerShell window and run:
-
-```powershell
-streamlit run live_traffic_dashboard.py
-```
-
-Streamlit opens the dashboard in your browser (normally at
-`http://localhost:8501`). Choose a day with the date picker, then drag the two
-handles on the object-count timeframe slider to select its start and end time;
-the handles are limited to the available data for that day.
-The object-count panel shows each vehicle type split by direction. Use the
-`Shown lines` selector to show or hide individual lines. These choices remain
-applied while the graph refreshes every five minutes.
-
-### Supabase cloud sync
-
-The cloud dashboard needs a shared data source because it cannot access this
-computer's camera or `outputs` folder. After the initial backfill, new count
-rows are uploaded directly by `car_counter.py` in a background worker.
-
-1. Create a Supabase project and run [supabase_setup.sql](supabase_setup.sql)
-   in its SQL Editor.
-2. Add the project URL and **service_role** key to the ignored `.env` file (do
-   not commit this key):
-
-   ```dotenv
-   SUPABASE_URL=https://YOUR-PROJECT.supabase.co
-   SUPABASE_SERVICE_ROLE_KEY=YOUR-SERVICE-ROLE-KEY
-   ```
-
-   Backfill existing history once by running:
-
-   ```powershell
-   python sync_counts_to_supabase.py
-   ```
-
-   The sync program uploads the existing CSV history. Once it completes, stop
-   it with `Ctrl+C`; future rows are uploaded directly by `car_counter.py`.
-
-3. In Streamlit Community Cloud, add these same two values in **App settings →
-   Secrets**:
-
-   ```toml
-   SUPABASE_URL = "https://YOUR-PROJECT.supabase.co"
-   SUPABASE_SERVICE_ROLE_KEY = "YOUR-SERVICE-ROLE-KEY"
-   ```
-
-   Redeploy the app. When these secrets are present, the live dashboard reads
-   the selected day's rows from Supabase; without them, it continues using local
-   CSV files.
-
-To analyse only selected runs, pass their file paths, for example:
-
-```powershell
-python vehicle_counter_analysis.py outputs/2026-08-11/count_20260811.csv
-```
-
-Use a different bucket width when needed, for example `--interval-minutes 10`.
-
-`vehicle_bytetrack.yaml` lowers ByteTrack's ID-creation threshold to match the bicycle threshold. A green box is accepted, but it is written to the CSV only after it receives a stable tracker ID and travels at least `MIN_DIRECTION_DISTANCE_RATIO` across the selected crop.
-
-For long-running sessions, tracker histories and counted IDs that have been absent for two minutes are removed automatically to keep memory use bounded.
-
-Bicycles use the shorter `BICYCLE_DIRECTION_DISTANCE_RATIO` (3% of the selected crop width); other vehicle types use `MIN_DIRECTION_DISTANCE_RATIO` (8%). The video displays boxes only.
-
-`car_counter.py` uses the faster `yolo11n.pt`. The video part of the window shows only detection boxes; a separate sidebar shows the right and left totals.
-
-## GPU acceleration
-
-In day mode, the program automatically uses CUDA when PyTorch detects an NVIDIA GPU; otherwise it uses the CPU. Verify your active environment with `python -c "import torch; print(torch.cuda.is_available())"`. If it prints `False`, install a CUDA-enabled PyTorch build compatible with your NVIDIA driver, then update Ultralytics in that same environment.
-
-No normal runtime details are printed to the terminal. Green boxes are accepted (`score >= 0.40`); orange boxes are rejected and never counted.
-
-## Road Crop
-
-At startup, a `Camera Preview` window opens. Wait until the DroidCam image is visible, then press `S`. Drag a rectangle around the road in `Select Road Crop` and press Enter or Space to confirm it. Press `C` to cancel and use the full camera frame. The preview and detector use only the selected crop.
-
-## Night Mode
-
-Set `NIGHT_MODE = True` to use moving bright lights instead of YOLO car detection. It is intended for visible headlights at night and can count reflections or other moving lights as vehicles, so select a tight road crop first.
-
-`LIGHT_MERGE_WIDTH` joins nearby headlights into one vehicle box. Grouping and track retention further reduce duplicate IDs from separated lights and short detection gaps. Increase `LIGHT_GROUP_X_DISTANCE` if one car is still split; decrease it if neighbouring cars are merged together.
+- `yolo11m.pt` is the default cloud detector. Change `MODEL_PATH` in `/root/counter.env`, for example `MODEL_PATH=yolo11s.pt`, then restart the counter to trade accuracy for speed.
+- Car colours use CLIP and are classified only for cars/vans, not trucks, buses, or bicycles. `0` means unknown; colour codes `1` through `10` represent black, white, grey, silver, red, blue, green, yellow, orange, and brown.
+- Vast public ports and IP addresses are instance-specific. Update both the local `.env` and cloud `/root/counter.env` whenever the instance changes.
+- Previous local-counter and inference implementations are preserved in `legacy/`. They are not part of the cloud deployment.
