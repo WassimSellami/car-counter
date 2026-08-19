@@ -19,8 +19,7 @@ SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 COLOR_NAMES = {1: "black", 2: "white", 3: "grey", 4: "silver", 5: "red", 6: "blue", 7: "green", 8: "yellow", 9: "orange", 10: "brown"}
 COLOR_HEX = {"black": "#242424", "white": "#f3f3f3", "grey": "#808080", "silver": "#c0c0c0", "red": "#e53935", "blue": "#2d82d7", "green": "#41a85f", "yellow": "#f5dc28", "orange": "#ff8c00", "brown": "#874b2a"}
-TRACE_NAMES = [f"{vehicle_type} - {direction}" for vehicle_type in VEHICLE_TYPE_LABELS.values() if vehicle_type != "Bicycle" for direction in ("Into Passau", "Out of Passau")]
-
+TRACE_NAMES = [f"{vehicle_type} — {direction}" for vehicle_type in VEHICLE_TYPE_LABELS.values() if vehicle_type != "Bicycle" for direction in ("Into Passau", "Out of Passau")]
 
 def supabase_headers() -> dict[str, str]:
     return {"apikey": SUPABASE_SERVICE_ROLE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"}

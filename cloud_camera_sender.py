@@ -77,10 +77,10 @@ def select_road() -> tuple[np.ndarray, tuple[int, int]]:
 
 def main() -> None:
     load_dotenv()
-    base_url = os.environ.get("CLOUD_COUNTER_URL", "").rstrip("/")
+    base_url = os.environ.get("COUNTER_PUBLIC_URL", "").rstrip("/")
     api_key = os.environ.get("CLOUD_INFERENCE_API_KEY", "")
     if not base_url or not api_key:
-        raise RuntimeError("Set CLOUD_COUNTER_URL and CLOUD_INFERENCE_API_KEY in .env")
+        raise RuntimeError("Set COUNTER_PUBLIC_URL and CLOUD_INFERENCE_API_KEY in .env")
 
     road_points, road_size = select_road()
     camera = open_camera(CAMERA_SOURCE, CAMERA_WIDTH, CAMERA_HEIGHT)
