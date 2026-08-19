@@ -4,6 +4,7 @@ from collections import Counter, defaultdict, deque
 import asyncio
 from datetime import date, datetime
 import csv
+import json
 import os
 from pathlib import Path
 from threading import Lock, Thread
@@ -26,6 +27,7 @@ from ultralytics.utils import IterableSimpleNamespace, YAML
 API_KEY = os.environ["CLOUD_INFERENCE_API_KEY"]
 MODEL_PATH = os.environ.get("MODEL_PATH", "yolo11m.pt")
 OUTPUT_ROOT = Path(os.environ.get("COUNTER_OUTPUT_DIR", "/workspace/outputs"))
+PHONE_CROP_CONFIG = Path(os.environ.get("PHONE_CROP_CONFIG", "/workspace/car-counter/phone_crop.json"))
 UPLOAD_TO_SUPABASE = os.environ.get("UPLOAD_TO_SUPABASE", "false").lower() == "true"
 INTO_PASSAU_IS_DOWN = os.environ.get("INTO_PASSAU_IS_DOWN", os.environ.get("INTO_PASSAU_IS_RIGHT", "true")).lower() == "true"
 COLOR_LABELS = ("black", "white", "grey", "silver", "red", "blue", "green", "yellow", "orange", "brown")
@@ -199,8 +201,55 @@ def _publish(image: np.ndarray) -> None:
         output_frames.append((output_sequence, jpeg.tobytes()))
 
 
+def _rectify_phone_images(images: list[np.ndarray], rotation: int, points_header: str) -> list[np.ndarray]:
+    """Rotate phone frames upright, then rectify the app's four selected corners."""
+    if rotation not in (0, 90, 180, 270) or not points_header:
+        return images
+    try:
+        points = np.array([float(value) for value in points_header.split(",")], dtype=np.float32)
+        if points.size != 8 or np.any(points < 0) or np.any(points > 1):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid crop points")
+    rotate_code = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+    rotated = [cv2.rotate(image, rotate_code[rotation]) if rotation else image for image in images]
+    height, width = rotated[0].shape[:2]
+    source = points.reshape(4, 2) * np.array([width, height], dtype=np.float32)
+    output_width = max(2, round((np.linalg.norm(source[1] - source[0]) + np.linalg.norm(source[2] - source[3])) / 2))
+    output_height = max(2, round((np.linalg.norm(source[3] - source[0]) + np.linalg.norm(source[2] - source[1])) / 2))
+    destination = np.float32([[0, 0], [output_width - 1, 0], [output_width - 1, output_height - 1], [0, output_height - 1]])
+    projection = cv2.getPerspectiveTransform(source, destination)
+    return [cv2.warpPerspective(image, projection, (output_width, output_height)) for image in rotated]
+
+
+@app.post("/phone-crop")
+def phone_crop(payload: dict, x_api_key: str = Header(default="")):
+    """Store crop coordinates once for the RTMP bridge."""
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    try:
+        points = [float(value) for value in payload["points"]]
+        if len(points) != 8 or any(value < 0 or value > 1 for value in points):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="points must contain eight values from 0 to 1")
+    PHONE_CROP_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    temporary = PHONE_CROP_CONFIG.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"points": points}), encoding="utf-8")
+    temporary.replace(PHONE_CROP_CONFIG)
+    return {"ok": True}
+
+
+@app.post("/rtmp-auth")
+def rtmp_auth(payload: dict):
+    """MediaMTX asks this local endpoint before accepting a publisher."""
+    if payload.get("action") != "publish" or payload.get("path") != "phone" or payload.get("user") != "phone" or payload.get("password") != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid RTMP publisher")
+    return {"ok": True}
+
+
 @app.post("/ingest-batch")
-async def ingest_batch(frames: list[UploadFile], x_api_key: str = Header(default="")):
+async def ingest_batch(frames: list[UploadFile], x_api_key: str = Header(default=""), x_frame_rotation: int = Header(default=0), x_crop_points: str = Header(default="")):
     global last_input_at
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -209,6 +258,7 @@ async def ingest_batch(frames: list[UploadFile], x_api_key: str = Header(default
     images = [cv2.imdecode(np.frombuffer(await frame.read(), np.uint8), cv2.IMREAD_COLOR) for frame in frames]
     if any(image is None for image in images):
         raise HTTPException(status_code=400, detail="Invalid image")
+    images = _rectify_phone_images(images, x_frame_rotation, x_crop_points)
     started = time.perf_counter()
     with lock:
         if last_input_at:

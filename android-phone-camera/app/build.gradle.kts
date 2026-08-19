@@ -54,4 +54,6 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-service:2.8.7")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // 2.6.4 is the latest release compatible with this project's Android 35 SDK.
+    implementation("com.github.pedroSG94.RootEncoder:library:2.6.4")
 }

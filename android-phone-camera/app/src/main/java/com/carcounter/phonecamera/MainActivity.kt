@@ -73,6 +73,8 @@ class MainActivity : AppCompatActivity() {
         val points = cameraImagePoints(previewPoints)
         securePrefs().edit().putString("url", baseUrl).putString("key", key)
             .apply { previewPoints.forEachIndexed { index, value -> putFloat("point_$index", value) } }.apply()
+        // RootEncoder owns Camera2 while streaming; release the preview first.
+        ProcessCameraProvider.getInstance(this).get().unbindAll()
         ContextCompat.startForegroundService(this, Intent(this, CameraUploadService::class.java)
             .putExtra(CameraUploadService.URL, baseUrl).putExtra(CameraUploadService.API_KEY, key)
             .putExtra(CameraUploadService.POINTS, points))

@@ -1,0 +1,11 @@
+rtmp: true
+rtmpAddress: :40097
+hls: false
+webrtc: false
+
+authMethod: http
+authHTTPAddress: http://127.0.0.1:8000/rtmp-auth
+
+paths:
+  phone:
+    source: publisher
