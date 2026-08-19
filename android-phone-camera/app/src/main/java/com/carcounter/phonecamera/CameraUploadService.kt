@@ -51,7 +51,8 @@ class CameraUploadService : Service(), ConnectChecker {
                 saveCrop(baseUrl, apiKey, points)
                 val rtmpUrl = rtmpUrl(baseUrl)
                 checkRtmpTcp(rtmpUrl)
-                val publisher = RtmpStream(this, this, Camera2Source(this), NoAudioSource())
+                val camera = Camera2Source(this)
+                val publisher = RtmpStream(this, this, camera, NoAudioSource())
                 if (!publisher.prepareVideo(1920, 1080, 6_000_000, 30, 2, 90) || !publisher.prepareAudio(32_000, false, 64_000)) {
                     report("Could not prepare H.264 stream")
                     stopSelf()
@@ -60,6 +61,9 @@ class CameraUploadService : Service(), ConnectChecker {
                 stream = publisher
                 publisher.startStream(rtmpUrl)
                 report("Connecting H.264 stream…")
+                // A fixed road camera should settle once, then keep that lens position.
+                Thread.sleep(2_500)
+                if (camera.disableAutoFocus()) report("Streaming with focus locked")
             } catch (error: Exception) {
                 report("Start failed: ${error.message ?: error.javaClass.simpleName}")
                 stopSelf()
