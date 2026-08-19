@@ -48,8 +48,8 @@ class CameraUploadService : Service(), ConnectChecker {
             try {
                 saveCrop(baseUrl, apiKey, points)
                 val publisher = RtmpStream(this, this, Camera2Source(this), NoAudioSource())
-                if (!publisher.prepareVideo(1920, 1080, 6_000_000, 30, 2, 90)) {
-                    report("Camera does not support 1080p H.264")
+                if (!publisher.prepareVideo(1920, 1080, 6_000_000, 30, 2, 90) || !publisher.prepareAudio(32_000, false, 64_000)) {
+                    report("Could not prepare H.264 stream")
                     stopSelf()
                     return@execute
                 }
