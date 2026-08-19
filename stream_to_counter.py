@@ -3,15 +3,16 @@ import json
 import os
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import cv2
 import numpy as np
 import requests
 
 
-STREAM_URL = os.environ.get("PHONE_STREAM_URL", "rtmp://127.0.0.1:40097/phone")
 COUNTER_URL = os.environ.get("COUNTER_INTERNAL_URL", "http://127.0.0.1:8000").rstrip("/")
 API_KEY = os.environ["CLOUD_INFERENCE_API_KEY"]
+STREAM_URL = os.environ.get("PHONE_STREAM_URL", f"rtmp://phone:{quote(API_KEY, safe='')}@127.0.0.1:10100/phone")
 CONFIG_PATH = Path(os.environ.get("PHONE_CROP_CONFIG", "/workspace/car-counter/phone_crop.json"))
 BATCH_SIZE = 10
 
