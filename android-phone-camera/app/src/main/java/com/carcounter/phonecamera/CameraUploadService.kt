@@ -49,7 +49,7 @@ class CameraUploadService : Service(), ConnectChecker {
         worker.execute {
             try {
                 saveCrop(baseUrl, apiKey, points)
-                val rtmpUrl = rtmpUrl(baseUrl, apiKey)
+                val rtmpUrl = rtmpUrl(baseUrl)
                 checkRtmpTcp(rtmpUrl)
                 val publisher = RtmpStream(this, this, Camera2Source(this), NoAudioSource())
                 if (!publisher.prepareVideo(1920, 1080, 6_000_000, 30, 2, 90) || !publisher.prepareAudio(32_000, false, 64_000)) {
@@ -78,9 +78,9 @@ class CameraUploadService : Service(), ConnectChecker {
         }
     }
 
-    private fun rtmpUrl(baseUrl: String, apiKey: String): String {
+    private fun rtmpUrl(baseUrl: String): String {
         val host = Uri.parse(baseUrl).host ?: error("Invalid Vast URL")
-        return "rtmp://phone:${Uri.encode(apiKey)}@$host:${BuildConfig.RTMP_PORT}/phone"
+        return "rtmp://$host:${BuildConfig.RTMP_PORT}/phone"
     }
 
     private fun checkRtmpTcp(url: String) {

@@ -9,14 +9,13 @@ import os
 from pathlib import Path
 from threading import Lock, Thread
 import time
-from urllib.parse import unquote
 
 import cv2
 import numpy as np
 import requests
 import torch
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, UploadFile
+from fastapi import FastAPI, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
@@ -57,6 +56,8 @@ csv_day: date | None = None
 csv_file = None
 csv_writer = None
 next_record_id = 1
+phone_stream_ip = ""
+phone_stream_authorized_until = 0.0
 
 
 def _open_csv() -> None:
@@ -224,7 +225,7 @@ def _rectify_phone_images(images: list[np.ndarray], rotation: int, points_header
 
 
 @app.post("/phone-crop")
-def phone_crop(payload: dict, x_api_key: str = Header(default="")):
+def phone_crop(payload: dict, request: Request, x_api_key: str = Header(default="")):
     """Store crop coordinates once for the RTMP bridge."""
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -234,21 +235,25 @@ def phone_crop(payload: dict, x_api_key: str = Header(default="")):
             raise ValueError
     except (KeyError, TypeError, ValueError):
         raise HTTPException(status_code=400, detail="points must contain eight values from 0 to 1")
+    global phone_stream_ip, phone_stream_authorized_until
     PHONE_CROP_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     temporary = PHONE_CROP_CONFIG.with_suffix(".tmp")
     temporary.write_text(json.dumps({"points": points}), encoding="utf-8")
     temporary.replace(PHONE_CROP_CONFIG)
+    phone_stream_ip = request.client.host if request.client else ""
+    phone_stream_authorized_until = time.monotonic() + 300
+    print(f"Phone RTMP pairing created for {phone_stream_ip}", flush=True)
     return {"ok": True}
 
 
 @app.post("/rtmp-auth")
 def rtmp_auth(payload: dict):
     """MediaMTX asks this local endpoint before accepting a publisher."""
-    password_matches = unquote(str(payload.get("password", ""))) == API_KEY
-    print(f"RTMP auth action={payload.get('action')} path={payload.get('path')} user={payload.get('user')!r} ip={payload.get('ip')} password_matches={password_matches}", flush=True)
+    paired_ip_matches = payload.get("ip") == phone_stream_ip and time.monotonic() < phone_stream_authorized_until
+    print(f"RTMP auth action={payload.get('action')} path={payload.get('path')} ip={payload.get('ip')} paired_ip_matches={paired_ip_matches}", flush=True)
     if payload.get("action") == "read" and payload.get("path") == "phone" and payload.get("ip") in ("127.0.0.1", "::1"):
         return {"ok": True}
-    if payload.get("action") != "publish" or payload.get("path") != "phone" or payload.get("user") != "phone" or not password_matches:
+    if payload.get("action") != "publish" or payload.get("path") != "phone" or not paired_ip_matches:
         raise HTTPException(status_code=403, detail="Invalid RTMP publisher")
     return {"ok": True}
 
