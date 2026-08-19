@@ -8,7 +8,7 @@ Native Kotlin app that replaces `cloud_camera_sender.py`: it encodes the rear ca
 2. Run it on an Android phone (Android 8+), grant Camera permission, and enter:
    - Vast URL: `http://VAST_IP:PUBLIC_8000_PORT`
    - API key: the same `CLOUD_INFERENCE_API_KEY` configured on Vast.
-3. Mount the phone, use the rear camera, frame the road in the preview, and tap **Start sending**. The app saves the crop first, then publishes to `rtmp://VAST_IP:COUNTER_RTMP_PORT/phone` automatically. `COUNTER_RTMP_PORT` defaults to `40097`.
+3. Mount the phone, use the rear camera, frame the road in the preview, and tap **Start sending**. The app saves the crop first, then publishes to `rtmp://VAST_IP:COUNTER_RTMP_PORT/phone` automatically. It defaults to Vast's existing `40073 → 10100` port mapping.
 
 For a new installation, the fields are automatically filled from the repository's ignored parent [`.env`](../.env) file when you build the APK: `COUNTER_PUBLIC_URL` and `CLOUD_INFERENCE_API_KEY`. After starting once, the app stores them encrypted on the phone, so you do not need to re-enter them on later launches. Rebuild the APK after changing either value.
 

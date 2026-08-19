@@ -26,7 +26,7 @@ android {
         versionName = "1.0"
         buildConfigField("String", "DEFAULT_COUNTER_URL", buildConfigString(envValue("COUNTER_PUBLIC_URL")))
         buildConfigField("String", "DEFAULT_API_KEY", buildConfigString(envValue("CLOUD_INFERENCE_API_KEY")))
-        buildConfigField("String", "RTMP_PORT", buildConfigString(envValue("COUNTER_RTMP_PORT").ifBlank { "40097" }))
+        buildConfigField("String", "RTMP_PORT", buildConfigString(envValue("COUNTER_RTMP_PORT").ifBlank { "40073" }))
     }
 
     compileOptions {

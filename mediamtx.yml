@@ -1,5 +1,6 @@
 rtmp: true
-rtmpAddress: :1935
+# Vast already exposes public 40073 to this free internal port.
+rtmpAddress: :10100
 hls: false
 webrtc: false
 
