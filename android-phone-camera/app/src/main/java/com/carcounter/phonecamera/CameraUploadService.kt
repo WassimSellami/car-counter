@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.Intent
 import android.net.Uri
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.pedro.common.ConnectChecker
 import com.pedro.encoder.input.sources.audio.NoAudioSource
@@ -27,6 +28,7 @@ class CameraUploadService : Service(), ConnectChecker {
         const val POINTS = "points"
         private const val STOP = "com.carcounter.phonecamera.STOP"
         private const val CHANNEL = "capture"
+        private const val TAG = "CarCounterUpload"
     }
 
     private val worker = Executors.newSingleThreadExecutor()
@@ -52,7 +54,8 @@ class CameraUploadService : Service(), ConnectChecker {
                     return@execute
                 }
                 stream = publisher
-                publisher.startStream(rtmpUrl(baseUrl, apiKey))
+                publisher.getStreamClient().setAuthorization("phone", apiKey)
+                publisher.startStream(rtmpUrl(baseUrl))
                 report("Connecting H.264 stream…")
             } catch (error: Exception) {
                 report("Start failed: ${error.message ?: error.javaClass.simpleName}")
@@ -72,9 +75,9 @@ class CameraUploadService : Service(), ConnectChecker {
         }
     }
 
-    private fun rtmpUrl(baseUrl: String, apiKey: String): String {
+    private fun rtmpUrl(baseUrl: String): String {
         val host = Uri.parse(baseUrl).host ?: error("Invalid Vast URL")
-        return "rtmp://phone:${Uri.encode(apiKey)}@$host:${BuildConfig.RTMP_PORT}/phone"
+        return "rtmp://$host:${BuildConfig.RTMP_PORT}/phone"
     }
 
     override fun onConnectionStarted(url: String) = report("Connecting…")
@@ -85,6 +88,7 @@ class CameraUploadService : Service(), ConnectChecker {
     override fun onAuthSuccess() = report("RTMP authentication accepted")
 
     private fun report(message: String) {
+        Log.i(TAG, message)
         getSystemService(NotificationManager::class.java).notify(1, notification(message))
     }
 
