@@ -243,7 +243,9 @@ def phone_crop(payload: dict, x_api_key: str = Header(default="")):
 @app.post("/rtmp-auth")
 def rtmp_auth(payload: dict):
     """MediaMTX asks this local endpoint before accepting a publisher."""
-    if payload.get("action") not in ("publish", "read") or payload.get("path") != "phone" or payload.get("user") != "phone" or payload.get("password") != API_KEY:
+    if payload.get("action") == "read" and payload.get("path") == "phone" and payload.get("ip") in ("127.0.0.1", "::1"):
+        return {"ok": True}
+    if payload.get("action") != "publish" or payload.get("path") != "phone" or payload.get("user") != "phone" or payload.get("password") != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid RTMP publisher")
     return {"ok": True}
 
