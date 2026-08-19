@@ -54,8 +54,7 @@ class CameraUploadService : Service(), ConnectChecker {
                     return@execute
                 }
                 stream = publisher
-                publisher.getStreamClient().setAuthorization("phone", apiKey)
-                publisher.startStream(rtmpUrl(baseUrl))
+                publisher.startStream(rtmpUrl(baseUrl, apiKey))
                 report("Connecting H.264 stream…")
             } catch (error: Exception) {
                 report("Start failed: ${error.message ?: error.javaClass.simpleName}")
@@ -75,9 +74,9 @@ class CameraUploadService : Service(), ConnectChecker {
         }
     }
 
-    private fun rtmpUrl(baseUrl: String): String {
+    private fun rtmpUrl(baseUrl: String, apiKey: String): String {
         val host = Uri.parse(baseUrl).host ?: error("Invalid Vast URL")
-        return "rtmp://$host:${BuildConfig.RTMP_PORT}/phone"
+        return "rtmp://phone:${Uri.encode(apiKey)}@$host:${BuildConfig.RTMP_PORT}/phone"
     }
 
     override fun onConnectionStarted(url: String) = report("Connecting…")

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from threading import Lock, Thread
 import time
+from urllib.parse import unquote
 
 import cv2
 import numpy as np
@@ -243,10 +244,11 @@ def phone_crop(payload: dict, x_api_key: str = Header(default="")):
 @app.post("/rtmp-auth")
 def rtmp_auth(payload: dict):
     """MediaMTX asks this local endpoint before accepting a publisher."""
-    print(f"RTMP auth action={payload.get('action')} path={payload.get('path')} user={payload.get('user')!r} ip={payload.get('ip')} password_matches={payload.get('password') == API_KEY}", flush=True)
+    password_matches = unquote(str(payload.get("password", ""))) == API_KEY
+    print(f"RTMP auth action={payload.get('action')} path={payload.get('path')} user={payload.get('user')!r} ip={payload.get('ip')} password_matches={password_matches}", flush=True)
     if payload.get("action") == "read" and payload.get("path") == "phone" and payload.get("ip") in ("127.0.0.1", "::1"):
         return {"ok": True}
-    if payload.get("action") != "publish" or payload.get("path") != "phone" or payload.get("user") != "phone" or payload.get("password") != API_KEY:
+    if payload.get("action") != "publish" or payload.get("path") != "phone" or payload.get("user") != "phone" or not password_matches:
         raise HTTPException(status_code=403, detail="Invalid RTMP publisher")
     return {"ok": True}
 
