@@ -29,7 +29,7 @@ MODEL_PATH = os.environ.get("MODEL_PATH", "yolo11m.pt")
 OUTPUT_ROOT = Path(os.environ.get("COUNTER_OUTPUT_DIR", "/workspace/outputs"))
 PHONE_CROP_CONFIG = Path(os.environ.get("PHONE_CROP_CONFIG", "/workspace/car-counter/phone_crop.json"))
 UPLOAD_TO_SUPABASE = os.environ.get("UPLOAD_TO_SUPABASE", "false").lower() == "true"
-INTO_PASSAU_IS_DOWN = os.environ.get("INTO_PASSAU_IS_DOWN", os.environ.get("INTO_PASSAU_IS_RIGHT", "true")).lower() == "true"
+INTO_PASSAU_IS_RIGHT = os.environ.get("INTO_PASSAU_IS_RIGHT", "true").lower() == "true"
 COLOR_LABELS = ("black", "white", "grey", "silver", "red", "blue", "green", "yellow", "orange", "brown")
 COLOR_CODES = {name: index + 1 for index, name in enumerate(COLOR_LABELS)}
 CLASS_TO_TYPE = {1: 3, 2: 0, 5: 2, 7: 1}  # bicycle, car, bus, truck
@@ -171,7 +171,7 @@ def _classify_colours(images: list[np.ndarray], batches: list[list[dict]]) -> No
 
 
 def _count_and_annotate(image: np.ndarray, detections: list[dict]) -> None:
-    height = image.shape[0]
+    width = image.shape[1]
     for detection in detections:
         vehicle_type = CLASS_TO_TYPE[detection["class_id"]]
         confidence = detection["confidence"]
@@ -181,11 +181,11 @@ def _count_and_annotate(image: np.ndarray, detections: list[dict]) -> None:
         color = detection.get("color", "unknown")
         if accepted:
             history = track_history[track_id]
-            history.append((y1 + y2) // 2)
+            history.append((x1 + x2) // 2)
             if len(history) > 30:
                 history.pop(0)
             distance = history[-1] - history[0]
-            threshold = max(25, int(height * (0.03 if vehicle_type == 3 else 0.08)))
+            threshold = max(25, int(width * (0.03 if vehicle_type == 3 else 0.08)))
             direction = 1 if distance >= threshold else 0 if distance <= -threshold else None
             if direction is not None and track_id not in counted_ids:
                 _record(track_id, confidence, vehicle_type, direction, color)
@@ -295,7 +295,7 @@ async def ingest_batch(frames: list[UploadFile], x_api_key: str = Header(default
 def status(x_api_key: str = Header(default="")):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
-    into, out = (1, 0) if INTO_PASSAU_IS_DOWN else (0, 1)
+    into, out = (1, 0) if INTO_PASSAU_IS_RIGHT else (0, 1)
     with lock:
         return {"metrics": {**{key: round(value, 1) for key, value in metrics.items()}, "other_cloud_ms": 0}, "counts": {TYPE_NAMES[vehicle_type]: {"into_passau": counts[(vehicle_type, into)], "out_of_passau": counts[(vehicle_type, out)]} for vehicle_type in range(4)}, "colors": dict(color_counts)}
 
