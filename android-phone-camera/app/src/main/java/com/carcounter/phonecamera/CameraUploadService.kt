@@ -17,6 +17,8 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -47,6 +49,8 @@ class CameraUploadService : Service(), ConnectChecker {
         worker.execute {
             try {
                 saveCrop(baseUrl, apiKey, points)
+                val rtmpUrl = rtmpUrl(baseUrl, apiKey)
+                checkRtmpTcp(rtmpUrl)
                 val publisher = RtmpStream(this, this, Camera2Source(this), NoAudioSource())
                 if (!publisher.prepareVideo(1920, 1080, 6_000_000, 30, 2, 90) || !publisher.prepareAudio(32_000, false, 64_000)) {
                     report("Could not prepare H.264 stream")
@@ -54,7 +58,7 @@ class CameraUploadService : Service(), ConnectChecker {
                     return@execute
                 }
                 stream = publisher
-                publisher.startStream(rtmpUrl(baseUrl, apiKey))
+                publisher.startStream(rtmpUrl)
                 report("Connecting H.264 stream…")
             } catch (error: Exception) {
                 report("Start failed: ${error.message ?: error.javaClass.simpleName}")
@@ -77,6 +81,12 @@ class CameraUploadService : Service(), ConnectChecker {
     private fun rtmpUrl(baseUrl: String, apiKey: String): String {
         val host = Uri.parse(baseUrl).host ?: error("Invalid Vast URL")
         return "rtmp://phone:${Uri.encode(apiKey)}@$host:${BuildConfig.RTMP_PORT}/phone"
+    }
+
+    private fun checkRtmpTcp(url: String) {
+        val target = Uri.parse(url)
+        Socket().use { socket -> socket.connect(InetSocketAddress(target.host, target.port), 5_000) }
+        Log.i(TAG, "RTMP TCP reachable: ${target.host}:${target.port}")
     }
 
     override fun onConnectionStarted(url: String) = report("Connecting…")
