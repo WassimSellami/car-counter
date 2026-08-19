@@ -1,5 +1,5 @@
 rtmp: true
-rtmpAddress: :40097
+rtmpAddress: :1935
 hls: false
 webrtc: false
 

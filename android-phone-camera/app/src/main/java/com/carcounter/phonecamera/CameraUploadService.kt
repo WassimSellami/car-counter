@@ -74,7 +74,7 @@ class CameraUploadService : Service(), ConnectChecker {
 
     private fun rtmpUrl(baseUrl: String, apiKey: String): String {
         val host = Uri.parse(baseUrl).host ?: error("Invalid Vast URL")
-        return "rtmp://phone:${Uri.encode(apiKey)}@$host:40097/phone"
+        return "rtmp://phone:${Uri.encode(apiKey)}@$host:${BuildConfig.RTMP_PORT}/phone"
     }
 
     override fun onConnectionStarted(url: String) = report("Connecting…")
