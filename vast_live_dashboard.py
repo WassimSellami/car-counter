@@ -104,7 +104,7 @@ def render_status() -> None:
         metrics = data["metrics"]
         other = max(0, metrics["cloud_ms"] - metrics["yolo_ms"] - metrics["clip_ms"])
         cards = st.columns(6)
-        for card, label, value in zip(cards, ("Cloud", "YOLO", "CLIP", "Other cloud", "Process", "Stream"), (f"{metrics['cloud_ms']:.0f} ms", f"{metrics['yolo_ms']:.0f} ms", f"{metrics['clip_ms']:.0f} ms", f"{other:.0f} ms", f"{metrics['process_fps']:.1f} FPS", "30 FPS")):
+        for card, label, value in zip(cards, ("Cloud", "YOLO", "CLIP", "Other cloud", "Process", "Incoming"), (f"{metrics['cloud_ms']:.0f} ms", f"{metrics['yolo_ms']:.0f} ms", f"{metrics['clip_ms']:.0f} ms", f"{other:.0f} ms", f"{metrics['process_fps']:.1f} FPS", f"{metrics['input_fps']:.1f} FPS")):
             card.metric(label, value)
     render_counts(load_cloud_counts(selected_day))
 

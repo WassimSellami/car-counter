@@ -27,7 +27,7 @@ API_KEY = os.environ["CLOUD_INFERENCE_API_KEY"]
 MODEL_PATH = os.environ.get("MODEL_PATH", "yolo11m.pt")
 OUTPUT_ROOT = Path(os.environ.get("COUNTER_OUTPUT_DIR", "/workspace/outputs"))
 UPLOAD_TO_SUPABASE = os.environ.get("UPLOAD_TO_SUPABASE", "false").lower() == "true"
-INTO_PASSAU_IS_RIGHT = os.environ.get("INTO_PASSAU_IS_RIGHT", "true").lower() == "true"
+INTO_PASSAU_IS_DOWN = os.environ.get("INTO_PASSAU_IS_DOWN", os.environ.get("INTO_PASSAU_IS_RIGHT", "true")).lower() == "true"
 COLOR_LABELS = ("black", "white", "grey", "silver", "red", "blue", "green", "yellow", "orange", "brown")
 COLOR_CODES = {name: index + 1 for index, name in enumerate(COLOR_LABELS)}
 CLASS_TO_TYPE = {1: 3, 2: 0, 5: 2, 7: 1}  # bicycle, car, bus, truck
@@ -48,7 +48,8 @@ counts = {(vehicle_type, direction): 0 for vehicle_type in range(4) for directio
 color_counts: Counter[str] = Counter()
 output_frames: deque[tuple[int, bytes]] = deque(maxlen=180)
 output_sequence = 0
-metrics = {"cloud_ms": 0.0, "yolo_ms": 0.0, "clip_ms": 0.0, "process_fps": 0.0}
+metrics = {"cloud_ms": 0.0, "yolo_ms": 0.0, "clip_ms": 0.0, "process_fps": 0.0, "input_fps": 0.0}
+last_input_at = 0.0
 csv_day: date | None = None
 csv_file = None
 csv_writer = None
@@ -166,7 +167,7 @@ def _classify_colours(images: list[np.ndarray], batches: list[list[dict]]) -> No
 
 
 def _count_and_annotate(image: np.ndarray, detections: list[dict]) -> None:
-    width = image.shape[1]
+    height = image.shape[0]
     for detection in detections:
         vehicle_type = CLASS_TO_TYPE[detection["class_id"]]
         confidence = detection["confidence"]
@@ -176,11 +177,11 @@ def _count_and_annotate(image: np.ndarray, detections: list[dict]) -> None:
         color = detection.get("color", "unknown")
         if accepted:
             history = track_history[track_id]
-            history.append((x1 + x2) // 2)
+            history.append((y1 + y2) // 2)
             if len(history) > 30:
                 history.pop(0)
             distance = history[-1] - history[0]
-            threshold = max(25, int(width * (0.03 if vehicle_type == 3 else 0.08)))
+            threshold = max(25, int(height * (0.03 if vehicle_type == 3 else 0.08)))
             direction = 1 if distance >= threshold else 0 if distance <= -threshold else None
             if direction is not None and track_id not in counted_ids:
                 _record(track_id, confidence, vehicle_type, direction, color)
@@ -200,6 +201,7 @@ def _publish(image: np.ndarray) -> None:
 
 @app.post("/ingest-batch")
 async def ingest_batch(frames: list[UploadFile], x_api_key: str = Header(default="")):
+    global last_input_at
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     if not 1 <= len(frames) <= 12:
@@ -209,6 +211,10 @@ async def ingest_batch(frames: list[UploadFile], x_api_key: str = Header(default
         raise HTTPException(status_code=400, detail="Invalid image")
     started = time.perf_counter()
     with lock:
+        if last_input_at:
+            instantaneous_input_fps = len(images) / max(0.001, started - last_input_at)
+            metrics["input_fps"] = instantaneous_input_fps if metrics["input_fps"] == 0 else 0.85 * metrics["input_fps"] + 0.15 * instantaneous_input_fps
+        last_input_at = started
         yolo_started = time.perf_counter()
         results = model(images, classes=[1, 2, 5, 7], conf=0.05, imgsz=640, max_det=15, batch=len(images), verbose=False)
         metrics["yolo_ms"] = (time.perf_counter() - yolo_started) * 1000
@@ -229,7 +235,7 @@ async def ingest_batch(frames: list[UploadFile], x_api_key: str = Header(default
 def status(x_api_key: str = Header(default="")):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
-    into, out = (1, 0) if INTO_PASSAU_IS_RIGHT else (0, 1)
+    into, out = (1, 0) if INTO_PASSAU_IS_DOWN else (0, 1)
     with lock:
         return {"metrics": {**{key: round(value, 1) for key, value in metrics.items()}, "other_cloud_ms": 0}, "counts": {TYPE_NAMES[vehicle_type]: {"into_passau": counts[(vehicle_type, into)], "out_of_passau": counts[(vehicle_type, out)]} for vehicle_type in range(4)}, "colors": dict(color_counts)}
 
@@ -239,7 +245,9 @@ async def stream(key: str = ""):
     if key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid stream key")
     async def frames():
-        last_sequence = 0
+        # New viewers start live; old frames are not replayed after a refresh.
+        with lock:
+            last_sequence = output_sequence
         while True:
             with lock:
                 next_frame = next(((sequence, jpeg) for sequence, jpeg in output_frames if sequence > last_sequence), None)
